@@ -1,0 +1,36 @@
+site:
+  base_url: "https://simple-ni-yoku.net"
+  timezone: "Asia/Tokyo"
+  posts_per_run: 5
+  min_words: 600
+  category_names: ["deals","guides"]
+  affiliate_disclosure: "当サイトのリンクには広告（アフィリエイトリンク）が含まれます。"
+
+data_sources:
+  rakuten:
+    app_id: "${RAKUTEN_APP_ID}"
+    endpoint: "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601"
+    max_per_seed: 20
+    genreId: null
+
+keywords:
+  seeds:
+    - "USB C 65W 充電器 比較"
+    - "電動歯ブラシ 互換 替えブラシ"
+    - "プリンタ インク 互換型番"
+    - "小型除湿機 省エネ"
+    - "ワイヤレスマイク iPhone 接続"
+
+content:
+  ab_test: true
+  cta_variants: ["最安値を確認","レビューを読む","在庫を見る"]
+  review_floor: 3.2
+  price_floor: 1000
+  include_fields: ["itemName","itemPrice","itemUrl","reviewAverage","reviewCount","mediumImageUrls"]
+
+review:
+  rules_file: "src/review_rules.yaml"
+
+retry:
+  max_attempts: 3
+  backoff_sec: 10
