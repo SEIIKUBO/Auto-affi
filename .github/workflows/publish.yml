@@ -1,30 +1,32 @@
 name: publish
 on:
-schedule:
-- cron: '30 21 * * *' # 06:30 JST (UTC+9)
-workflow_dispatch:
+  schedule:
+    - cron: '30 21 * * *'   # 06:30 JST (UTC+9)
+  workflow_dispatch:        # ← これが手動実行を許可するトリガ
+
 jobs:
-run:
-runs-on: ubuntu-latest
-permissions:
-contents: read
-steps:
-- uses: actions/checkout@v4
-- uses: actions/setup-python@v5
-with: { python-version: '3.11' }
-- name: Install deps
-run: bash scripts/provision.sh
-- name: Run generator
-env:
-RAKUTEN_APP_ID: ${{ secrets.RAKUTEN_APP_ID }}
-WP_SITE_URL: ${{ secrets.WP_SITE_URL }}
-WP_USERNAME: ${{ secrets.WP_USERNAME }}
-WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
-ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
-run: python -u src/main.py --config config/app.yaml
-- name: Upload logs
-if: always()
-uses: actions/upload-artifact@v4
-with:
-name: logs
-path: run.log
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: bash scripts/provision.sh
+      - name: Run generator
+        env:
+          RAKUTEN_APP_ID: ${{ secrets.RAKUTEN_APP_ID }}
+          WP_SITE_URL: ${{ secrets.WP_SITE_URL }}
+          WP_USERNAME: ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+        run: python -u src/main.py --config config/app.yaml
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: run.log
