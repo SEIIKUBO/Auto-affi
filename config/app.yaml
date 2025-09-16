@@ -15,13 +15,17 @@ data_sources:
 
 keywords:
   seeds:
-   ["usb"]
+    - "USB C 65W 充電器 比較"
+    - "電動歯ブラシ 互換 替えブラシ"
+    - "プリンタ インク 互換型番"
+    - "小型除湿機 省エネ"
+    - "ワイヤレスマイク iPhone 接続"
 
 content:
   ab_test: true
   cta_variants: ["最安値を確認","レビューを読む","在庫を見る"]
-  review_floor: 3.2
-  price_floor: 1000
+  review_floor: 3.0
+  price_floor: 800
   include_fields: ["itemName","itemPrice","itemUrl","reviewAverage","reviewCount","mediumImageUrls"]
 
 review:
