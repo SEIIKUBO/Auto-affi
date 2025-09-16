@@ -20,25 +20,19 @@ def b64cred(user, pwd):
 def http_json(method, url, **kw):
     r = requests.request(method, url, timeout=30, **kw)
     if not r.ok:
-        # 生メッセージを短く残す（デバッグ用）
         LOG.error(f"http_error: {method} {url} -> {r.status_code} {r.text[:400]}")
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
     return r.json()
 
 def sanitize_keyword(kw: str) -> str:
-    """改行/タブ/全角スペースを除去し、連続空白を1つに"""
     if not kw:
         return ""
-    kw = kw.replace("\u3000", " ")                      # 全角スペース→半角
+    kw = kw.replace("\u3000", " ")
     kw = kw.replace("\r", " ").replace("\n", " ").replace("\t", " ")
-    kw = re.sub(r"\s+", " ", kw)                        # 連続空白圧縮
+    kw = re.sub(r"\s+", " ", kw)
     return kw.strip()
 
 def ensure_categories(names):
-    """
-    APIで新規作成はしない（権限最小のため）。
-    見つからなければ「未分類」にフォールバック。
-    """
     ids = []
     for name in names:
         try:
@@ -46,16 +40,12 @@ def ensure_categories(names):
                           params={"search": name, "per_page": 100})
             cid = next((c["id"] for c in q if c["name"].lower() == name.lower()), None)
             if cid:
-                ids.append(cid)
-                continue
-            # fallback: Uncategorized
+                ids.append(cid); continue
             default = http_json("GET", f"{WP_URL}/wp-json/wp/v2/categories",
                                 params={"slug": "uncategorized"})
-            if default:
-                ids.append(default[0]["id"])
-                LOG.warning(f"category '{name}' not found; fallback to Uncategorized")
-            else:
-                ids.append(1)  # 最終手段
+            if default: ids.append(default[0]["id"])
+            else: ids.append(1)
+            LOG.warning(f"category '{name}' not found; fallback to Uncategorized")
         except Exception as e:
             LOG.error(f"category ensure failed: {e}; fallback to id=1")
             ids.append(1)
@@ -66,17 +56,17 @@ def wp_post_exists(slug):
     return len(q) > 0
 
 def rakuten_items(app_id, kw, endpoint, max_per_seed, genreId=None):
-    app_id = (app_id or "").strip()                     # 改行や空白を除去
+    app_id = (app_id or "").strip()
     kw = sanitize_keyword(kw)
     params = {"applicationId": app_id, "keyword": kw,
               "hits": int(max_per_seed), "format": "json"}
-    if genreId:
-        params["genreId"] = genreId
+    if genreId: params["genreId"] = genreId
     r = requests.get(endpoint, params=params, timeout=30)
     if not r.ok:
         LOG.error(f"rakuten_api_error: HTTP {r.status_code} - {r.text[:400]}")
         r.raise_for_status()
-    return r.json().get("Items", [])
+    j = r.json()
+    return j.get("Items", [])
 
 def enrich(items):
     out = []
@@ -124,16 +114,12 @@ def render_html(kw, items, conf, cats):
     return title, body
 
 def notify(msg):
-    if not ALERT:
-        return
-    try:
-        requests.post(ALERT, json={"content": msg}, timeout=10)
-    except Exception as e:
-        LOG.error(f"alert failed: {e}")
+    if not ALERT: return
+    try: requests.post(ALERT, json={"content": msg}, timeout=10)
+    except Exception as e: LOG.error(f"alert failed: {e}")
 
 # ---------- main ----------
 def main():
-    # 設定ファイルの取得
     try:
         cfg_path = sys.argv[sys.argv.index("--config") + 1]
     except ValueError:
@@ -141,25 +127,20 @@ def main():
     with open(cfg_path, "r", encoding="utf-8") as f:
         conf = yaml.safe_load(f)
 
-    # ABテスト/ルール読込
     conf["ab_tests"] = yaml.safe_load(open("src/ab_tests.yaml", "r", encoding="utf-8")) \
         if conf.get("content", {}).get("ab_test") else {}
     rules = yaml.safe_load(open(conf["review"]["rules_file"], "r", encoding="utf-8"))
-
-    # カテゴリ確定（作成はしない）
     cats = ensure_categories(conf["site"]["category_names"])
 
     posted = 0
     for raw_kw in conf["keywords"]["seeds"]:
         kw = sanitize_keyword(raw_kw)
-        if not kw:
-            continue
-        if posted >= int(conf["site"]["posts_per_run"]):
-            break
+        if not kw: continue
+        if posted >= int(conf["site"]["posts_per_run"]): break
 
         slug = slugify(kw)
         if wp_post_exists(slug):
-            LOG.info(f"skip exists: {kw}")
+            LOG.info(f"skip exists (slug duplicate): {kw}")
             continue
 
         LOG.info(f"query kw='{kw}'")
@@ -170,39 +151,30 @@ def main():
             conf["data_sources"]["rakuten"]["max_per_seed"],
             conf["data_sources"]["rakuten"].get("genreId")
         )
-        items = [
-            it for it in enrich(arr)
-            if it["price"] >= conf["content"]["price_floor"]
-            and it["review_avg"] >= conf["content"]["review_floor"]
-        ]
-        if len(items) < 3:
-            LOG.info(f"thin content for {kw}, skipping")
+        total = len(arr)
+        enriched = enrich(arr)
+        after_price = [it for it in enriched if it["price"] >= conf["content"]["price_floor"]]
+        after_review = [it for it in after_price if it["review_avg"] >= conf["content"]["review_floor"]]
+
+        LOG.info(f"stats kw='{kw}': total={total}, enriched={len(enriched)}, "
+                 f"after_price={len(after_price)}, after_review={len(after_review)}")
+
+        if len(after_review) < 3:
+            LOG.info(f"skip thin (<3 items) for '{kw}'")
             continue
 
-        title, html = render_html(kw, items, conf, cats)
+        title, html = render_html(kw, after_review, conf, cats)
 
-        # ルールチェック
         blocked = False
         for bad in rules["prohibited_phrases"]:
             if bad in title or bad in html:
-                LOG.info(f"blocked phrase: {bad} in {kw}")
-                blocked = True
-                break
-        if blocked:
-            continue
+                LOG.info(f"blocked phrase '{bad}' in '{kw}'"); blocked = True; break
+        if blocked: continue
 
-        # 投稿
-        payload = {
-            "title": title,
-            "slug": slug,
-            "status": "publish",
-            "content": html,
-            "categories": cats
-        }
-        headers = {
-            "Authorization": f"Basic {b64cred(WP_USER, WP_APP_PW)}",
-            "Content-Type": "application/json"
-        }
+        payload = {"title": title, "slug": slug, "status": "publish",
+                   "content": html, "categories": cats}
+        headers = {"Authorization": f"Basic {b64cred(WP_USER, WP_APP_PW)}",
+                   "Content-Type": "application/json"}
         try:
             http_json("POST", f"{WP_URL}/wp-json/wp/v2/posts",
                       data=json.dumps(payload), headers=headers)
