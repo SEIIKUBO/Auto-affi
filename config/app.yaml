@@ -1,7 +1,7 @@
 site:
   base_url: "https://simple-ni-yoku.net"
   timezone: "Asia/Tokyo"
-  posts_per_run: 5
+  posts_per_run: 3
   min_words: 600
   category_names: ["deals","guides"]
   affiliate_disclosure: "当サイトのリンクには広告（アフィリエイトリンク）が含まれます。"
