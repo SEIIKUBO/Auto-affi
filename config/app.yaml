@@ -10,23 +10,24 @@ data_sources:
   rakuten:
     app_id: "${RAKUTEN_APP_ID}"
     endpoint: "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601"
-    max_per_seed: 20
+    max_per_seed: 30
     genreId: null
 
 keywords:
   seeds:
-    - "USB C 65W 充電器 比較"
-    - "電動歯ブラシ 互換 替えブラシ"
-    - "プリンタ インク 互換型番"
-    - "小型除湿機 省エネ"
-    - "ワイヤレスマイク iPhone 接続"
+    - "モバイルバッテリー 10000mAh PD"
+    - "Anker 65W 充電器"
+    - "電動歯ブラシ 替えブラシ オーラルB 互換"
+    - "エアダスター 充電式"
+    - "モニターライト 27インチ"
 
 content:
   ab_test: true
   cta_variants: ["最安値を確認","レビューを読む","在庫を見る"]
-  review_floor: 3.0
-  price_floor: 800
+  review_floor: 2.8
+  price_floor: 500
   include_fields: ["itemName","itemPrice","itemUrl","reviewAverage","reviewCount","mediumImageUrls"]
+  min_items: 2          # ← これ未満なら投稿しない（下のコードで参照）
 
 review:
   rules_file: "src/review_rules.yaml"
