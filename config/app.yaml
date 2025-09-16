@@ -1,7 +1,7 @@
 site:
   base_url: "https://simple-ni-yoku.net"
   timezone: "Asia/Tokyo"
-  posts_per_run: 3
+  posts_per_run: 6
   min_words: 600
   category_names: ["deals","guides"]
   affiliate_disclosure: "当サイトのリンクには広告（アフィリエイトリンク）が含まれます。"
@@ -20,14 +20,18 @@ keywords:
     - "電動歯ブラシ 替えブラシ オーラルB 互換"
     - "エアダスター 充電式"
     - "モニターライト 27インチ"
+    -"TypeC 65W 充電器 折りたたみ"
+    -"ワイヤレスマイク iphone lightning"
+    -"オーラルB 互換 ブラシ 型番 EB-20"
+    -"エアダスター usb 充電式"
 
 content:
   ab_test: true
   cta_variants: ["最安値を確認","レビューを読む","在庫を見る"]
-  review_floor: 2.8
+  review_floor: 3.2
   price_floor: 500
   include_fields: ["itemName","itemPrice","itemUrl","reviewAverage","reviewCount","mediumImageUrls"]
-  min_items: 2          # ← これ未満なら投稿しない（下のコードで参照）
+  min_items: 3          # ← これ未満なら投稿しない（下のコードで参照）
 
 review:
   rules_file: "src/review_rules.yaml"
