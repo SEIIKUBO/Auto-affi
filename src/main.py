@@ -8,11 +8,13 @@ return title, body
 
 
 def notify(msg):
-if not ALERT: return
-try:
-requests.post(ALERT, json={"content": msg}, timeout=10)
-except Exception as e:
-LOG.error(f"alert failed: {e}")
+    if not ALERT:
+        return
+    try:
+        requests.post(ALERT, json={"content": msg}, timeout=10)
+    except Exception as e:
+        LOG.error(f"alert failed: {e}")
+
 
 
 def main():
