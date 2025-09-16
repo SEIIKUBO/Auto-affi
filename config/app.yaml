@@ -15,11 +15,7 @@ data_sources:
 
 keywords:
   seeds:
-    - "USB C 65W 充電器 比較"
-    - "電動歯ブラシ 互換 替えブラシ"
-    - "プリンタ インク 互換型番"
-    - "小型除湿機 省エネ"
-    - "ワイヤレスマイク iPhone 接続"
+   ["usb"]
 
 content:
   ab_test: true
