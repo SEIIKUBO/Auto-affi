@@ -1,7 +1,16 @@
 import os, sys, json, time, base64, logging, math
+import re
 import requests, yaml
 from urllib.parse import urlencode
 from slugify import slugify
+
+def sanitize_keyword(kw: str) -> str:
+    if not kw:
+        return ""
+    kw = kw.replace("\u3000", " ")   # 全角スペース→半角
+    kw = kw.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    kw = re.sub(r"\s+", " ", kw)     # 連続スペース圧縮
+    return kw.strip()
 
 LOG = logging.getLogger("runner")
 logging.basicConfig(filename="run.log", level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -39,7 +48,9 @@ def wp_post_exists(slug):
     return len(q) > 0
 
 def rakuten_items(app_id, kw, endpoint, max_per_seed, genreId=None):
-    params = {"applicationId": app_id, "keyword": kw, "hits": max_per_seed}
+    app_id = (app_id or "").strip()
+    kw = sanitize_keyword(kw)
+    params = {"applicationId": app_id, "keyword": kw, "hits": max_per_seed, "format": "json"}
     if genreId:
         params["genreId"] = genreId
     r = requests.get(endpoint, params=params, timeout=30)
@@ -111,9 +122,12 @@ def main():
 
     posted = 0
     for kw in conf["keywords"]["seeds"]:
-        if posted >= conf["site"]["posts_per_run"]:
-            break
-        slug = slugify(kw)
+    kw = sanitize_keyword(kw)
+    if posted >= conf["site"]["posts_per_run"]:
+        break
+    slug = slugify(kw)
+    ...
+
         if wp_post_exists(slug):
             LOG.info(f"skip exists: {kw}")
             continue
