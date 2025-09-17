@@ -229,14 +229,14 @@ def build_article(kw, items, conf):
     table_html = "<table>"+header+"".join(rows)+"</table>"
     blocks.append(f"<!-- wp:table --><figure class=\"wp-block-table\">{table_html}</figure><!-- /wp:table -->")
 
-    # 各商品のカード説明 + ボタン（画像/ボタン＝文字以外の要素）
+    # 各商品のカード説明 + ボタン
     label_map = ["商品A","商品B","商品C","商品D","商品E"]
     for i,x in enumerate(top5, start=1):
         label = label_map[i-1] if i-1 < len(label_map) else f"商品{i}"
         desc = (
             f"{label}「{x['name']}」。{stars(x['review_avg'])}（{x['review_count']}件）で、"
             f"{'多ポート・高出力' if (x['ports']>=3 or (x['watt'] or 0)>=65) else 'バランス型'}。"
-            f"価格は{yen(x['price'])}。総合指標（レビュー密度）は{ x['score'] }で上位。"
+            f"価格は{yen(x['price'])}。総合指標（レビュー密度）は{x['score']}で上位。"
             f"初めての人でも扱いやすい一台です。"
         )
         blocks.append(f"<!-- wp:heading {{\"level\":3}} --><h3>{label}</h3><!-- /wp:heading -->")
@@ -250,7 +250,6 @@ def build_article(kw, items, conf):
                       f"<!-- wp:buttons --><div class=\"wp-block-buttons\"><div class=\"wp-block-button\">"
                       f"<a class=\"wp-block-button__link\" href=\"{x['url']}\" rel=\"sponsored noopener\">詳細と現在価格を見る</a>"
                       f"</div></div><!-- /wp:buttons --></div></div><!-- /wp:columns -->")
-        # 区切り線を適度に
         blocks.append("<!-- wp:separator --><hr class=\"wp-block-separator\"/><!-- /wp:separator -->")
 
     # 4. タイプ別のおすすめランキング（3カテゴリ×TOP3）
@@ -259,14 +258,12 @@ def build_article(kw, items, conf):
     def render_type_section(title, arr):
         blocks_local=[]
         blocks_local.append(f"<!-- wp:heading {{\"level\":3}} --><h3>{title} TOP3</h3><!-- /wp:heading -->")
-        # リスト（文字以外の要素）
         li=[]
         for rank,x in enumerate(arr[:3], start=1):
-            line = (f"<strong>{rank}. {x['name']}</strong> – 評価{ x['review_avg']:.1f }（{x['review_count']}件） / "
-                    f"価格{ yen(x['price']) } / 指標{ x['score'] }")
+            line = (f"<strong>{rank}. {x['name']}</strong> – 評価{x['review_avg']:.1f}（{x['review_count']}件） / "
+                    f"価格{yen(x['price'])} / 指標{x['score']}")
             li.append(f"<li>{line}</li>")
         blocks_local.append("<!-- wp:list --><ul>" + "".join(li) + "</ul><!-- /wp:list -->")
-        # ボタン集合
         btns = []
         for x in arr[:3]:
             btns.append(f"<div class=\"wp-block-button\"><a class=\"wp-block-button__link\" href=\"{x['url']}\" rel=\"sponsored noopener\">{x['name'][:22]}…をチェック</a></div>")
@@ -279,7 +276,7 @@ def build_article(kw, items, conf):
     blocks.append("<!-- wp:separator --><hr class=\"wp-block-separator\"/><!-- /wp:separator -->")
     blocks += render_type_section("小型・軽量が良い人におすすめ", typeC)
 
-    # 5. 選定基準・選定方法（説明文を厚めにして文字数確保）
+    # 5. 選定基準・選定方法
     blocks.append("<!-- wp:heading --><h2>ランキングの選定基準・選定方法</h2><!-- /wp:heading -->")
     criteria = (
         "本ランキングは、楽天公式APIから取得した公開データを用い、"
@@ -288,7 +285,6 @@ def build_article(kw, items, conf):
         "用途別の推薦を行っています。個別レビュー文の転載は行わず、数値集計とリンクのみで付加価値を提供します。"
     )
     blocks.append(f"<!-- wp:paragraph --><p>{criteria}</p><!-- /wp:paragraph -->")
-    # 引用（文字以外の要素）
     blocks.append("<!-- wp:quote --><blockquote class=\"wp-block-quote\"><p>注意：価格や在庫、配送条件は常に変動します。購入前に必ずリンク先で最新情報をご確認ください。</p><cite>運営より</cite></blockquote><!-- /wp:quote -->")
 
     # 6. まとめ（CTA）
@@ -299,7 +295,6 @@ def build_article(kw, items, conf):
     )
     blocks.append("<!-- wp:heading --><h2>まとめ</h2><!-- /wp:heading -->")
     blocks.append(f"<!-- wp:paragraph --><p>{summary}</p><!-- /wp:paragraph -->")
-    # ボタン（文字以外の要素）
     blocks.append(f"<!-- wp:buttons --><div class=\"wp-block-buttons\"><div class=\"wp-block-button\"><a class=\"wp-block-button__link\" href=\"{best['url']}\" rel=\"sponsored noopener\">まずは総合1位の価格を確認</a></div></div><!-- /wp:buttons -->")
 
     # 免責/法務（TOS/ガイドライン配慮）
@@ -380,7 +375,7 @@ def main():
 
         title, content, excerpt = build_article(kw, after_review, conf)
 
-        # 禁止表現チェック（誇大表現など）
+        # 禁止表現チェック
         blocked = False
         for bad in rules["prohibited_phrases"]:
             if bad in title or bad in content:
