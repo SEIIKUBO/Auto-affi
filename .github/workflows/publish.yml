@@ -10,9 +10,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -21,7 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pyyaml python-slugify openai
 
-      - name: Run generator (hybrid: Rakuten + ChatGPT API)
+      - name: Run generator (Rakuten + ChatGPT API)
         env:
           RAKUTEN_APP_ID: ${{ secrets.RAKUTEN_APP_ID }}
           WP_SITE_URL: ${{ secrets.WP_SITE_URL }}
@@ -35,8 +37,8 @@ jobs:
       - name: Print run.log
         if: always()
         run: |
+          echo '----- tail run.log -----'
           if [ -f run.log ]; then
-            echo '----- tail run.log -----'
             tail -n 400 run.log
           else
             echo 'run.log not found'
