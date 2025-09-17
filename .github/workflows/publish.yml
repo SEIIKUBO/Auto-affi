@@ -1,7 +1,7 @@
 name: publish
 on:
   schedule:
-    - cron: '30 21 * * *'   # 06:30 JST (UTC+9)
+    - cron: '30 21 * * *'   # 06:30 JST
   workflow_dispatch:
 
 jobs:
@@ -18,19 +18,15 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pyyaml python-slugify
+          pip install requests pyyaml python-slugify openai
 
-      - name: Show repo tree
-        run: |
-          pwd
-          ls -R
-
-      - name: Run generator
+      - name: Run generator (hybrid: Rakuten + ChatGPT API)
         env:
           RAKUTEN_APP_ID: ${{ secrets.RAKUTEN_APP_ID }}
           WP_SITE_URL: ${{ secrets.WP_SITE_URL }}
           WP_USERNAME: ${{ secrets.WP_USERNAME }}
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
         run: |
           python -u src/main.py --config config/app.yaml
@@ -50,4 +46,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logs
-          path: run.log
+          path: |
+            run.log
+            llm_prompt.json
+            llm_output.txt
