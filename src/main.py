@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Hybrid v3 (LLM required, structured alerts, robust config, keyword expansion)
+Hybrid v3.1 (LLM required, model fallback, structured alerts, robust config, keyword expansion)
 - Facts: Rakuten API（30件/ページを自動ページング）
 - Body: ChatGPT API（必須。テンプレ無し）
 - Alerts: 人間可読 + JSON（Discord）
@@ -8,6 +8,7 @@ Hybrid v3 (LLM required, structured alerts, robust config, keyword expansion)
 - Keywords: mode=static | pools | expand_llm
 - Slug: 重複時は -YYYYMMDD（既定ON）
 - Guards: 文字数/必須ブロック/rel属性/法務NG→投稿しない＋通知
+- NEW: LLMモデルは conf.llm.model が未提供/未権限なら conf.llm.fallback_models の順で自動フォールバック
 """
 
 import os, sys, json, time, base64, logging, math, re, random
@@ -37,7 +38,6 @@ DEFAULT_MIN_ITEMS = 2
 LLM_DEFAULT_MODEL = "gpt-4o-mini"
 LLM_TEMPERATURE = 0.4
 LLM_MAXTOKENS = 5500
-BTN_CLASS = "wp-block-button__link"
 
 # ---------- time utils ----------
 def jst_tz(): return timezone(timedelta(hours=9))
@@ -166,7 +166,7 @@ def openai_client():
     from openai import OpenAI
     return OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------- Prompts（仕様書反映・厳密JSON返却） ----------
+# ---------- Prompts ----------
 def sys_prompt():
     return (
         "あなたは「一次情報最優先・法令順守のアフィリエイト記事ライター兼編集者」です。"
@@ -213,7 +213,7 @@ def user_prompt(facts_json):
             + "\n\n【仕様書】\n" + spec
             + "\n【注意】\n- 事実は提供JSONのみ。未記載の数値や主張は書かない。\n- すべてのリンクに rel='sponsored noopener nofollow'。\n- 出力は厳密JSONのみ。")
 
-# ---------- LLM ----------
+# ---------- LLM (with fallback) ----------
 def save_artifacts(prompt_obj, raw, plan):
     try:
         with open("llm_prompt.json","w",encoding="utf-8") as f: json.dump(prompt_obj,f,ensure_ascii=False,indent=2)
@@ -223,41 +223,64 @@ def save_artifacts(prompt_obj, raw, plan):
     except Exception as e:
         LOG.error(f"artifact save failed: {e}")
 
+def is_model_not_found(exc_text:str)->bool:
+    if not exc_text: return False
+    t = exc_text.lower()
+    return ("model_not_found" in t) or ("does not exist" in t and "model" in t) or ("error code: 404" in t)
+
 def llm_plan_json(kw, items, conf, inputs, policy):
     if not OPENAI_API_KEY:
         notify_event("LLM_DISABLED","error", kw,"setup","OPENAI_API_KEY missing")
-        LOG.error("OPENAI_API_KEY missing")
-        return None
+        LOG.error("OPENAI_API_KEY missing"); return None
+
     client = openai_client()
     llm_cfg = conf.get("llm", {}) if isinstance(conf.get("llm"), dict) else {}
-    model = llm_cfg.get("model", LLM_DEFAULT_MODEL)
-    temp  = float(llm_cfg.get("temperature", LLM_TEMPERATURE))
+    primary = llm_cfg.get("model", LLM_DEFAULT_MODEL)
+    fallbacks = llm_cfg.get("fallback_models", ["gpt-4o-mini", "gpt-4o", "o4-mini"])
+    models_to_try = [m for m in [primary] + fallbacks if m]
+
     facts = build_facts_json(kw, items, inputs, policy)
     prompt_obj = {"system": sys_prompt(), "user": user_prompt(facts)}
     raw = ""
-    for attempt in range(1,3):
-        try:
-            resp = client.chat.completions.create(
-                model=model, temperature=temp, max_tokens=LLM_MAXTOKENS,
-                messages=[{"role":"system","content":prompt_obj["system"]},
-                          {"role":"user","content":prompt_obj["user"]}]
-            )
-            raw = (resp.choices[0].message.content or "").strip()
-            plan = None
+
+    for model in models_to_try:
+        for attempt in range(1,3):
             try:
-                plan = json.loads(raw)
-            except Exception:
-                m=re.search(r"\{.*\}", raw, flags=re.DOTALL)
-                if m:
-                    try: plan = json.loads(m.group(0))
-                    except Exception: plan = None
-            save_artifacts(prompt_obj, raw, plan)
-            if plan: return plan
-            notify_event("LLM_PARSE_ERROR","warning", kw,"llm_call","LLM応答をJSONとして解釈できない", attempt=attempt, sample=raw[:500])
-        except Exception as e:
-            notify_event("LLM_CALL_FAILED","error", kw,"llm_call","OpenAI API呼び出しに失敗", attempt=attempt, exception=str(e))
-            time.sleep(2)
-    notify_event("LLM_FAILED_FINAL","error", kw,"llm_call","再試行の結果も失敗")
+                resp = client.chat.completions.create(
+                    model=model, temperature=float(llm_cfg.get("temperature", LLM_TEMPERATURE)),
+                    max_tokens=LLM_MAXTOKENS,
+                    messages=[
+                        {"role":"system","content":prompt_obj["system"]},
+                        {"role":"user","content":prompt_obj["user"]}
+                    ]
+                )
+                raw = (resp.choices[0].message.content or "").strip()
+                plan = None
+                try:
+                    plan = json.loads(raw)
+                except Exception:
+                    m=re.search(r"\{.*\}", raw, flags=re.DOTALL)
+                    if m:
+                        try: plan = json.loads(m.group(0))
+                        except Exception: plan = None
+                save_artifacts({**prompt_obj, "model_used": model}, raw, plan)
+                if plan:
+                    if model != primary:
+                        notify_event("LLM_MODEL_FALLBACK","warning", kw,"llm_call",
+                                     f"指定モデルからフォールバックして成功", from_model=primary, to_model=model)
+                    return plan
+                notify_event("LLM_PARSE_ERROR","warning", kw,"llm_call",
+                             "LLM応答をJSONとして解釈できない", attempt=attempt, model=model, sample=raw[:500])
+            except Exception as e:
+                et = str(e)
+                notify_event("LLM_CALL_FAILED","error", kw,"llm_call","OpenAI API呼び出しに失敗",
+                             attempt=attempt, model=model, exception=et)
+                # モデル未提供/未権限なら次のモデルへ
+                if is_model_not_found(et):
+                    break
+                time.sleep(2)
+        # 次モデルへ（primaryで404等→fallback通知は成功時に送る）
+    notify_event("LLM_FAILED_FINAL","error", kw,"llm_call","全モデル試行が失敗")
     return None
 
 # ---------- validate ----------
@@ -273,13 +296,12 @@ def validate_gutenberg(html: str, min_chars:int, max_chars:int):
     if html.count("<!-- wp:buttons")<1: errs.append("few_buttons")
     return (len(errs)==0), errs
 
-# ---------- Keywords (NEW) ----------
+# ---------- Keywords ----------
 def kw_from_pools(conf, need:int):
     pools = (conf.get("keywords") or {}).get("pools") or {}
     nouns = pools.get("nouns") or []
     modifiers = pools.get("modifiers") or []
     specs = pools.get("specs") or []
-    # 組合せ
     cands = set()
     for n in nouns:
         cands.add(n)
@@ -292,7 +314,7 @@ def kw_from_pools(conf, need:int):
     return cands[:max(need, 0)]
 
 def kw_expand_llm(conf, need:int):
-    if not OPENAI_API_KEY: 
+    if not OPENAI_API_KEY:
         notify_event("KW_EXPAND_SKIP","warning","","kw","OPENAI_API_KEY missing")
         return []
     client = openai_client()
@@ -322,7 +344,6 @@ def get_seed_list(conf, posts_per_run:int):
     kwcfg = conf.get("keywords") or {}
     mode = kwcfg.get("mode","static")
     base = kwcfg.get("seeds") or []
-    # 1回のRunで多めに候補を持つ（投稿数の 3〜5 倍）
     need = int(kwcfg.get("max_candidates", posts_per_run*4))
     if mode == "static":
         return base
@@ -388,7 +409,6 @@ def main():
         notify_event("LLM_DISABLED","error","","setup","OPENAI_API_KEY missing（Run中断）")
         LOG.error("OPENAI_API_KEY missing — abort"); return
 
-    # ここでキーワード候補を取得（NEW）
     seeds = get_seed_list(conf, posts_per_run)
     if not seeds:
         notify_event("NO_SEEDS","warning","","kw","候補キーワードが空のため、投稿なし")
@@ -447,12 +467,7 @@ def main():
             LOG.error(f"validation failed: {errs}")
             continue
 
-        # 法務NG
-        try:
-            bads = bads  # noqa: reuse from above
-        except Exception:
-            bads = []
-        if any(b in body for b in bads):
+        if any(b in body for b in (bads or [])):
             notify_event("BLOCKED_BY_RULE","warning", kw,"rule","法務/NG語に該当")
             LOG.info(f"blocked by rule for '{kw}'")
             continue
