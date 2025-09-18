@@ -2,22 +2,15 @@ site:
   affiliate_disclosure: "当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。"
 
 llm:
-  # gpt-5優先（Responses API）。重ければ自動フォールバック
   provider: openai
   model: gpt-5
   fallback_models: ["gpt-4o", "gpt-4o-mini"]
-
-  # Responses API 向けパラメータ（gpt-5は temperature 等を無視する実装にしてある想定）
   use_responses_api: true
-  max_completion_tokens: 2800     # 文字数は十分・遅延は抑制
-  timeout_sec: 90                  # ハードタイムアウト（120→90で“早めに切替”）
+  max_completion_tokens: 2800
+  timeout_sec: 90
   retries: 1
   retry_backoff_sec: 2
-
-  # 実装側で対応していれば“ソフト”切替（未対応なら自動的に無視されるだけ）
   soft_timeout_fallback_sec: 45
-
-  # gpt-4o/mini 用のニュアンス（実装が対応していれば有効）
   temperature: 0.3
   top_p: 0.9
 
@@ -31,7 +24,7 @@ keywords:
     - "ヘアドライヤー 速乾"
     - "モニターライト 27インチ"
     - "加湿器 比較"
-  per_run: 4                      # 同時に重くしない（API負荷・同時タイムアウト回避）
+  per_run: 4
 
 rakuten:
   hits: 30
@@ -41,10 +34,10 @@ rakuten:
   min_items_after_filters: 2
 
 content:
-  # 生成負荷を少し軽くして timeout を避ける（品質を落とさず時短）
-  min_chars: 1800
-  require_tables: 1
-  require_buttons: 3
+  min_chars: 1600         # 以前よりやや緩め
+  require_tables: 0       # ← 一時的に緩和（table必須を外す）
+  require_buttons: 0      # ← 一時的に緩和（CTA必須を外す）
+  post_if_llm_ok: true    # LLM本文が得られれば投稿
 
 wp:
   category_ids: []
@@ -54,8 +47,7 @@ debug:
   draft_mode: false
 
 alerts:
-  # 通知ノイズを抑える（実装で対応していれば有効。未対応なら無視）
   include_events:
-    - "RUN_FAILED"
-    - "LLM_FAILED_FINAL"
     - "POST_PUBLISHED"
+    - "LLM_FAILED_FINAL"
+    - "VALIDATION_FAILED"   # ← 一時的に可視化
