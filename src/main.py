@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Hybrid v2 (strict LLM required, structured alerts, robust config)
-- Facts: Rakuten API
+- Facts: Rakuten API（30件/ページを自動ページング）
 - Body: ChatGPT API（必須）
 - No template fallback: 失敗/未設定時は投稿せずDiscordへ通知
 - Alerts: 人間可読 + JSON（コピペでAIが解析しやすい）
-- Config robustness: 重要キーが欠落しても安全なデフォルトで補正し、警告通知
+- Config robustness: 欠落キーは安全デフォルトで補正し、警告通知
+- Slug: 重複時はオプションで当日サフィックス自動付与
 - Guards: 文字数/必須ブロック/rel属性/法務NG→投稿しない＋通知
 """
 
@@ -38,11 +39,17 @@ LLM_TEMPERATURE = 0.4
 LLM_MAXTOKENS = 5500
 BTN_CLASS = "wp-block-button__link"
 
-# ---------- utils ----------
-def jst_now_iso():
-    jst = timezone(timedelta(hours=9))
-    return datetime.now(jst).isoformat(timespec="seconds")
+# ---------- time utils ----------
+def jst_tz():
+    return timezone(timedelta(hours=9))
 
+def jst_now_iso():
+    return datetime.now(jst_tz()).isoformat(timespec="seconds")
+
+def jst_date_compact():
+    return datetime.now(jst_tz()).strftime("%Y%m%d")
+
+# ---------- runtime ctx ----------
 def runtime_context():
     repo = os.getenv("GITHUB_REPOSITORY") or ""
     run_id = os.getenv("GITHUB_RUN_ID") or ""
@@ -55,6 +62,7 @@ def runtime_context():
     return {"repo": repo, "workflow": workflow, "run_id": run_id, "run_attempt": attempt,
             "branch": ref_name, "sha": sha, "run_url": run_url}
 
+# ---------- small utils ----------
 def b64cred(u, p): return base64.b64encode(f"{u}:{p}".encode()).decode()
 
 def http_json(method, url, **kw):
@@ -69,6 +77,7 @@ def sanitize_keyword(kw: str) -> str:
     kw = kw.replace("\u3000"," ").replace("\r"," ").replace("\n"," ").replace("\t"," ")
     return re.sub(r"\s+"," ",kw).strip()
 
+# ---------- Alerts (Discord) ----------
 def notify_event(event:str, severity:str, kw:str="", stage:str="", reason:str="", **extra):
     """
     人間可読 + JSON をまとめて送信。
@@ -106,35 +115,82 @@ def wp_post_exists(slug):
     q=http_json("GET", f"{WP_URL}/wp-json/wp/v2/posts", params={"slug":slug})
     return len(q)>0
 
+def unique_slug(base_slug:str, enable_date_suffix:bool)->str:
+    """
+    enable_date_suffix=True のとき、重複なら -YYYYMMDD を付与して一意化。
+    それでも存在する場合は -YYYYMMDD-2 とする。
+    """
+    if not wp_post_exists(base_slug):
+        return base_slug
+    if not enable_date_suffix:
+        LOG.info(f"slug duplicate and date suffix disabled: {base_slug}")
+        return base_slug  # 呼び出し側で skip する
+    date = jst_date_compact()
+    slug = f"{base_slug}-{date}"
+    if not wp_post_exists(slug):
+        notify_event(event="DUPLICATE_SLUG_SUFFIX", severity="info", kw=base_slug,
+                     stage="prepost", reason="slug重複のため当日サフィックスを付与", new_slug=slug)
+        return slug
+    # 連番
+    n=2
+    while wp_post_exists(f"{slug}-{n}") and n<=5:
+        n+=1
+    new_slug = f"{slug}-{n}"
+    notify_event(event="DUPLICATE_SLUG_SUFFIX", severity="info", kw=base_slug,
+                 stage="prepost", reason="slug重複のため当日サフィックス+連番を付与", new_slug=new_slug)
+    return new_slug
+
 # ---------- Rakuten ----------
-def rakuten_items(app_id, kw, endpoint, hits, genreId=None):
-    kw=sanitize_keyword(kw)
-    params={"applicationId":app_id,"keyword":kw,"hits":int(hits),"format":"json"}
-    if genreId: params["genreId"]=genreId
-    try:
-        r=requests.get(endpoint, params=params, timeout=30)
-        if not r.ok:
-            LOG.error(f"rakuten_api_error kw='{kw}': HTTP {r.status_code} - {r.text[:300]}")
-            if r.status_code==400: return []
-        return (r.json() or {}).get("Items",[])
-    except Exception as e:
-        LOG.error(f"rakuten_request_exception kw='{kw}': {e}")
-        return []
+def rakuten_items(app_id, kw, endpoint, want_max, genreId=None):
+    """
+    Rakuten IchibaItem Search 20220601
+    - hits は最大30。超える場合は page を進めて合算（簡易ページング）。
+    - 過剰なAPI呼び出しを避けるため page 上限は 5（= 最大150件取得）に制限。
+    """
+    kw = sanitize_keyword(kw)
+    per_page = 30
+    remaining = max(1, int(want_max))
+    page = 1
+    max_pages = min(5, (remaining + per_page - 1)//per_page)
+    out = []
+    while remaining > 0 and page <= max_pages:
+        hits = min(per_page, remaining)
+        params = {"applicationId": app_id, "keyword": kw, "hits": hits, "page": page, "format":"json"}
+        if genreId: params["genreId"] = genreId
+        try:
+            r = requests.get(endpoint, params=params, timeout=30)
+            if not r.ok:
+                LOG.error(f"rakuten_api_error kw='{kw}': HTTP {r.status_code} - {r.text[:300]}")
+                # 400 wrong_parameter 等は以降のページも期待薄なので中断
+                break
+            items = (r.json() or {}).get("Items", []) or []
+            out.extend(items)
+            # 次ページ条件
+            if len(items) < hits:
+                break
+            remaining -= hits
+            page += 1
+            time.sleep(0.25)  # 礼儀ディレイ
+        except Exception as e:
+            LOG.error(f"rakuten_request_exception kw='{kw}': {e}")
+            break
+    return out
 
 def enrich(items):
     out=[]
     for it in items:
-        i=it["Item"]
+        i=it.get("Item", {})
         price=int(i.get("itemPrice") or 0)
         rev=float(i.get("reviewAverage") or 0.0)
         rct=int(i.get("reviewCount") or 0)
         score=rev*math.log1p(max(rct,1))
         out.append({
-            "name":i.get("itemName"),
-            "url":i.get("itemUrl"),
-            "image":(i.get("mediumImageUrls") or [{"imageUrl":""}])[0]["imageUrl"],
+            "name":i.get("itemName",""),
+            "url":i.get("itemUrl",""),
+            "image":(i.get("mediumImageUrls") or [{"imageUrl":""}])[0].get("imageUrl",""),
             "price":price,"review_avg":rev,"review_count":rct,"score":round(score,2)
         })
+    out = [x for x in out if x["name"] and x["url"]]
     out.sort(key=lambda x:(-x["score"], x["price"]))
     return out
 
@@ -231,12 +287,15 @@ def save_artifacts(prompt_obj, raw, plan):
     except Exception as e:
         LOG.error(f"artifact save failed: {e}")
 
+def openai_client_wrapped():
+    from openai import OpenAI
+    return OpenAI(api_key=OPENAI_API_KEY)
+
 def llm_plan_json(kw, items, conf, inputs, policy):
     if not OPENAI_API_KEY:
         notify_event(event="LLM_DISABLED", severity="error", kw=kw, stage="setup", reason="OPENAI_API_KEY missing")
         LOG.error("OPENAI_API_KEY missing")
         return None
-    from openai import OpenAI
     client = openai_client()
     llm_cfg = conf.get("llm", {}) if isinstance(conf.get("llm"), dict) else {}
     model = llm_cfg.get("model", LLM_MODEL)
@@ -284,6 +343,7 @@ def validate_gutenberg(html: str, min_chars:int, max_chars:int):
     if html.count("<!-- wp:buttons")<1: errs.append("few_buttons")
     return (len(errs)==0), errs
 
+# ---------- WP ----------
 def create_post(payload):
     headers={"Authorization": f"Basic {b64cred(WP_USER, WP_APP_PW)}","Content-Type":"application/json"}
     try:
@@ -319,6 +379,7 @@ def main():
     category_names = site.get("category_names") or ["レビュー"]
     posts_per_run = int(site.get("posts_per_run", 1))
     internal_link = site.get("internal_link", "")
+    unique_slug_date = bool(site.get("unique_slug_date", True))  # 既定でONにしました
 
     disclosure = site.get("affiliate_disclosure")
     if not disclosure:
@@ -352,16 +413,20 @@ def main():
         if posted>=posts_per_run: break
         kw=sanitize_keyword(raw_kw)
         if not kw: continue
-        slug=slugify(kw)
-        if wp_post_exists(slug):
+        base_slug=slugify(kw)
+        slug = unique_slug(base_slug, unique_slug_date)
+        if not unique_slug_date and wp_post_exists(slug):
             LOG.info(f"skip exists (slug duplicate): {kw}")
             continue
 
         LOG.info(f"query kw='{kw}'")
-        arr = rakuten_items(RAKUTEN_APP_ID,
-                            kw, conf["data_sources"]["rakuten"]["endpoint"],
-                            conf["data_sources"]["rakuten"]["max_per_seed"],
-                            conf["data_sources"]["rakuten"].get("genreId"))
+        arr = rakuten_items(
+            RAKUTEN_APP_ID,
+            kw,
+            conf["data_sources"]["rakuten"]["endpoint"],
+            conf["data_sources"]["rakuten"]["max_per_seed"],
+            conf["data_sources"]["rakuten"].get("genreId")
+        )
         enriched=enrich(arr)
         after_price=[it for it in enriched if it["price"]>=conf["content"]["price_floor"]]
         after_review=[it for it in after_price if it["review_avg"]>=conf["content"]["review_floor"]]
@@ -400,9 +465,9 @@ def main():
             LOG.error(f"validation failed: {errs}")
             continue
 
-        if any(b in body for b in bads):
+        if any(b in body for b in rules.get("prohibited_phrases", []) if isinstance(rules, dict)):
             notify_event(event="BLOCKED_BY_RULE", severity="warning", kw=kw, stage="rule",
-                         reason="法務/NG語に該当", ng_hits=[b for b in bads if b in body])
+                         reason="法務/NG語に該当")
             LOG.info(f"blocked by rule for '{kw}'")
             continue
 
