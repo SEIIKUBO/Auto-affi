@@ -1,22 +1,20 @@
 # -*- coding: utf-8 -*-
-import os, sys, json, time, logging, base64, textwrap, traceback
+import os, sys, json, time, logging, base64, re, traceback
 from datetime import datetime, timezone, timedelta
 import requests, yaml
 from slugify import slugify
 
 """
-gpt-5 最適化（Responses API）
-- response_format は使わない（400回避）
-- text.format も送らない（型不一致400回避）。Markdownはプロンプトで強制。
-- gpt-5 → gpt-4o → gpt-4o-mini に自動フォールバック
-- 失敗時は投稿せず Discord に整形JSONで通知
-- Rakuten hits<=30 厳守、400はDiscord通知
-- AFFINGERボタン・表・最小文字数のバリデーション
-- プロンプト/出力をデバッグ保存（llm_prompt.json / llm_output.txt）
+Fixes:
+- gpt-5(Responses API) 向け: temperature を送らない。必要に応じて自動リトライで温度/トークン指定を切替。
+- キーワード拡張の出力を強力にサニタイズ（```json や「json」行などを除去）。
+- 失敗時はDiscordへ機械判読しやすいJSONを通知。
+- Rakuten API: hits<=30 厳守。
 """
 
 # ---------------- 基本設定 ----------------
-logging.basicConfig(filename='run.log', level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(filename='run.log', level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s')
 JST = timezone(timedelta(hours=9))
 
 RAKUTEN_APP_ID  = os.getenv("RAKUTEN_APP_ID", "").strip()
@@ -54,8 +52,8 @@ def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     if not cfg.get("site", {}).get("affiliate_disclosure"):
-        alert("CONFIG_DEFAULTED", "warning", {
-            "kw":"", "stage":"setup",
+        alert("CONFIG_DEFAULTED","warning",{
+            "kw":"","stage":"setup",
             "reason":"site.affiliate_disclosure が未設定のためデフォルトを適用",
             "defaults":{"affiliate_disclosure":"当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。"}
         })
@@ -154,22 +152,28 @@ class LLMClient:
             raise RuntimeError("OPENAI_API_KEY missing")
         self.base_url = "https://api.openai.com/v1"
 
-    def _responses_call(self, prompt, model):
+    @staticmethod
+    def _is_gpt5(model:str)->bool:
+        return model.lower().startswith("gpt-5")
+
+    def _call_responses_once(self, prompt, model, include_temp=True, use_max_output_tokens=True):
         url = f"{self.base_url}/responses"
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-        # NOTE: text.format や response_format は送らない（400回避）
-        body = {
-            "model": model,
-            "input": prompt,
-            "temperature": self.temperature,
-            "max_output_tokens": self.max_output_tokens
-        }
+        body = { "model": model, "input": prompt }
+        if include_temp and not self._is_gpt5(model):
+            body["temperature"] = self.temperature
+        if use_max_output_tokens:
+            body["max_output_tokens"] = self.max_output_tokens
+        else:
+            body["max_completion_tokens"] = self.max_output_tokens
+
         r = requests.post(url, headers=headers, data=json.dumps(body), timeout=self.timeout)
         if r.status_code != 200:
             raise RuntimeError(f"HTTP {r.status_code} - {r.text}")
         data = r.json()
         text = data.get("output_text")
         if not text:
+            # fallback parse
             try:
                 chunks=[]
                 for out in data.get("output", []):
@@ -183,6 +187,31 @@ class LLMClient:
             raise ValueError("empty_completion")
         return text
 
+    def _responses_call(self, prompt, model):
+        """
+        リトライ方針：
+        1) gpt-5系は temperature を送らない
+        2) 400で 'max_output_tokens' がダメなら 'max_completion_tokens' に切替
+        3) 400で 'temperature' 不可なら温度を抜いて再送
+        """
+        # まず推奨形
+        try:
+            return self._call_responses_once(prompt, model,
+                                             include_temp=not self._is_gpt5(model),
+                                             use_max_output_tokens=True)
+        except RuntimeError as e:
+            msg = str(e)
+            # tokensパラメータ差し替え
+            if "max_output_tokens" in msg and "Use 'max_completion_tokens'" in msg:
+                return self._call_responses_once(prompt, model,
+                                                 include_temp=not self._is_gpt5(model),
+                                                 use_max_output_tokens=False)
+            if "Unsupported parameter: 'temperature'" in msg:
+                return self._call_responses_once(prompt, model,
+                                                 include_temp=False,
+                                                 use_max_output_tokens=True)
+            raise
+
     def complete(self, prompt):
         tried=[]
         for model in [self.model_primary] + self.fallback_models:
@@ -194,7 +223,7 @@ class LLMClient:
             except Exception as e:
                 tried.append({"model":model,"exception":repr(e)})
                 alert("LLM_CALL_FAILED","error",{"stage":"llm_call","model":model,"exception":repr(e)})
-                time.sleep(1.0)
+                time.sleep(0.8)
         raise RuntimeError(f"LLM failed: {tried}")
 
 # ---------------- 生成プロンプト ----------------
@@ -217,7 +246,7 @@ PROMPT_SPEC = """あなたは「一次情報最優先・法令順守のアフィ
 - Markdownの比較表（| を使う）を必ず1つ以上。
 - AFFINGERボタンを最低3つ以上（各候補の下に）。
 - 本文末に脚注として引用URLを列挙。
-- 余計な前置きは不要、本文のみ。
+- 余計な前置きは不要、**本文のみ**（コードブロック禁止）。
 """
 
 def build_items_block(items):
@@ -257,27 +286,85 @@ def save_debug_output(kw, model, text):
         f.write(f"\n===== {kw} | model={model} =====\n")
         f.write(text+"\n")
 
+# ------- キーワード拡張（堅牢サニタイズ） -------
+_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*$")
+_BRACKETS_RE = re.compile(r"^[\[\]\{\}\(\)`\"']+$")
+
+def _clean_lines(text:str):
+    lines = [ln.strip() for ln in text.splitlines()]
+    out = []
+    in_code = False
+    for ln in lines:
+        if ln.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:  # コードブロックは無視
+            continue
+        # プレフィックス記号の除去
+        ln = re.sub(r"^[-*•・\d\.)\]]+\s*", "", ln)
+        if not ln: continue
+        if ln.lower() in ("json","array","output"): continue
+        if _CODE_FENCE_RE.match(ln): continue
+        if _BRACKETS_RE.match(ln): continue
+        out.append(ln)
+    return out
+
+def _parse_kw_list(raw:str):
+    # JSON配列を抽出できれば最優先
+    m_start = raw.find("[")
+    m_end   = raw.rfind("]")
+    if m_start != -1 and m_end != -1 and m_end > m_start:
+        sub = raw[m_start:m_end+1]
+        try:
+            arr = json.loads(sub)
+            if isinstance(arr, list):
+                return [str(x).strip() for x in arr]
+        except Exception:
+            pass
+    # 行単位の箇条書きから抽出
+    cand = _clean_lines(raw)
+    return cand
+
 def kw_expand(llm: LLMClient, seeds, how_many=8):
-    prompt = f"""以下の日本語シードから、家電/デジタル/日用品/生活/育児など**異なるジャンル**に広げて検索意図が明確なキーワードを {how_many} 件、JSON配列だけで出力して。
-例: ["65W USB充電器 比較","電動歯ブラシ コスパ 用途別","ロボット掃除機 静音 小型"]
-シード: {json.dumps(seeds, ensure_ascii=False)}"""
+    prompt = (
+        "以下の日本語シードから、家電/デジタル/日用品/生活/育児など**異なるジャンル**に広げて、"
+        f"検索意図が明確なキーワードを {how_many} 件、**JSON配列のみ**で出力してください。"
+        "コードブロックやバッククォート、前置きは禁止。例: "
+        "[\"65W USB充電器 比較\",\"電動歯ブラシ コスパ\",\"ロボット掃除機 静音 小型\"]\n"
+        f"シード: {json.dumps(seeds, ensure_ascii=False)}"
+    )
     try:
         txt, used_model = llm.complete(prompt)
-        arr=[]
-        try:
-            arr = json.loads(txt)
-            if not isinstance(arr, list): arr=[]
-        except Exception:
-            arr = [x.strip("・- ") for x in txt.splitlines() if x.strip()]
-        out = [x for x in arr if isinstance(x,str) and 3<=len(x)<=30]
-        if not out: raise ValueError("kw_empty")
-        return out[:how_many]
-    except Exception:
+        arr = _parse_kw_list(txt)
+        # サニタイズ & フィルタ
+        cleaned=[]
+        seen=set()
+        for s in arr:
+            s = s.strip().strip("、,.;:[]{}()\"'`")
+            s = re.sub(r"\s+", " ", s)
+            if not s: continue
+            if s.lower() in ("json","array","output"): continue
+            if any(tok in s for tok in ["```","{","}"]): continue
+            if len(s) < 2 or len(s) > 30: continue
+            if s in seen: continue
+            seen.add(s)
+            cleaned.append(s)
+        if not cleaned:
+            raise ValueError("kw_empty")
+        out = cleaned[:how_many]
+        logging.info("kw_expanded: " + ", ".join(out))
+        return out
+    except Exception as e:
         alert("KW_EXPAND_FAILED","warning",{"kw":"","stage":"kw","reason":"LLMでのキーワード拡張に失敗"})
-        return seeds[:how_many]
+        # フォールバック：シードから頭出し
+        return seeds[:how_many] if seeds else ["USB充電器 65W","電動歯ブラシ コスパ"]
+
+# ------- 本文生成 -------
+PROMPT_SPEC = PROMPT_SPEC  # 上で定義済みの本文プロンプトを再利用
 
 def generate_article(llm: LLMClient, kw, items, cfg):
-    prompt = PROMPT_SPEC.format(KW=kw, ITEMS=build_items_block(items), DISCLOSURE=cfg["site"]["affiliate_disclosure"])
+    items_block = build_items_block(items)
+    prompt = PROMPT_SPEC.format(KW=kw, ITEMS=items_block, DISCLOSURE=cfg["site"]["affiliate_disclosure"], URL="{URL}")
     save_debug_prompt(kw, prompt)
     md, used_model = llm.complete(prompt)
     save_debug_output(kw, used_model, md)
@@ -322,7 +409,7 @@ def main():
             continue
 
         title = extract_title(md)
-        slug  = make_slug(title)
+        slug  = slugify(title or kw, lowercase=True, allow_unicode=False)[:80]
         if wp_slug_exists(slug):
             logging.info(f"skip exists (slug duplicate): {title}")
             continue
