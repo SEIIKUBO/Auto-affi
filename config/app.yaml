@@ -2,14 +2,26 @@ site:
   affiliate_disclosure: "当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。"
 
 llm:
+  # gpt-5優先（Responses API）。重ければ自動フォールバック
+  provider: openai
   model: gpt-5
   fallback_models: ["gpt-4o", "gpt-4o-mini"]
-  temperature: 0.35          # gpt-5には送られません（実装側で抑止）
-  max_output_tokens: 6000
-  timeout_sec: 120
+
+  # Responses API 向けパラメータ（gpt-5は temperature 等を無視する実装にしてある想定）
+  use_responses_api: true
+  max_completion_tokens: 2800     # 文字数は十分・遅延は抑制
+  timeout_sec: 90                  # ハードタイムアウト（120→90で“早めに切替”）
+  retries: 1
+  retry_backoff_sec: 2
+
+  # 実装側で対応していれば“ソフト”切替（未対応なら自動的に無視されるだけ）
+  soft_timeout_fallback_sec: 45
+
+  # gpt-4o/mini 用のニュアンス（実装が対応していれば有効）
+  temperature: 0.3
+  top_p: 0.9
 
 keywords:
-  # 幅広ジャンルにして当たりやすく
   seeds:
     - "USB充電器 65W"
     - "電動歯ブラシ コスパ"
@@ -19,17 +31,18 @@ keywords:
     - "ヘアドライヤー 速乾"
     - "モニターライト 27インチ"
     - "加湿器 比較"
-  per_run: 8                  # 1回あたりの試行数を増やす
+  per_run: 4                      # 同時に重くしない（API負荷・同時タイムアウト回避）
 
 rakuten:
-  hits: 30                    # API上限に合わせる
-  min_review_count: 5         # ← 10→5 に緩和
+  hits: 30
+  min_review_count: 5
   min_price: 1000
   max_price: 9999999
-  min_items_after_filters: 2   # ← 3→2 に緩和（薄い市場でも拾える）
+  min_items_after_filters: 2
 
 content:
-  min_chars: 1800             # ← 2000→1800（落ちにくく）
+  # 生成負荷を少し軽くして timeout を避ける（品質を落とさず時短）
+  min_chars: 1800
   require_tables: 1
   require_buttons: 3
 
@@ -39,3 +52,10 @@ wp:
 
 debug:
   draft_mode: false
+
+alerts:
+  # 通知ノイズを抑える（実装で対応していれば有効。未対応なら無視）
+  include_events:
+    - "RUN_FAILED"
+    - "LLM_FAILED_FINAL"
+    - "POST_PUBLISHED"
