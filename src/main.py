@@ -1,14 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Hybrid v3.1 (LLM required, model fallback, structured alerts, robust config, keyword expansion)
-- Facts: Rakuten API（30件/ページを自動ページング）
-- Body: ChatGPT API（必須。テンプレ無し）
-- Alerts: 人間可読 + JSON（Discord）
-- Config: 欠落は安全デフォルト＋警告通知
-- Keywords: mode=static | pools | expand_llm
-- Slug: 重複時は -YYYYMMDD（既定ON）
-- Guards: 文字数/必須ブロック/rel属性/法務NG→投稿しない＋通知
-- NEW: LLMモデルは conf.llm.model が未提供/未権限なら conf.llm.fallback_models の順で自動フォールバック
+Hybrid v3.2
+- LLM必須（テンプレ無効） + 自動フォールバック
+- 本文が短い/表なし/CTA不足でも自己修復：
+  * 比較表とCTAボタンはプログラムで必ず生成・挿入
+  * 文字数不足はLLMで自動追記（最大2回）→ 3000–5000字へ
+- Discord通知は人間可読 + JSON。gpt5の404は冗長通知を抑制
 """
 
 import os, sys, json, time, base64, logging, math, re, random
@@ -38,6 +35,7 @@ DEFAULT_MIN_ITEMS = 2
 LLM_DEFAULT_MODEL = "gpt-4o-mini"
 LLM_TEMPERATURE = 0.4
 LLM_MAXTOKENS = 5500
+EXPAND_TRIES = 2  # 長文化の自動追記回数
 
 # ---------- time utils ----------
 def jst_tz(): return timezone(timedelta(hours=9))
@@ -57,7 +55,7 @@ def runtime_context():
     return {"repo": repo, "workflow": workflow, "run_id": run_id, "run_attempt": attempt,
             "branch": ref_name, "sha": sha, "run_url": run_url}
 
-# ---------- small utils ----------
+# ---------- utils ----------
 def b64cred(u, p): return base64.b64encode(f"{u}:{p}".encode()).decode()
 def http_json(method, url, **kw):
     r = requests.request(method, url, timeout=30, **kw)
@@ -170,24 +168,20 @@ def openai_client():
 def sys_prompt():
     return (
         "あなたは「一次情報最優先・法令順守のアフィリエイト記事ライター兼編集者」です。"
-        "日本語で、H2中心の構成・正確性重視・不必要に煽らないトーンで執筆します。"
-        "楽天APIで提供された事実のみを使用し、価格・在庫は変動前提。未確定の価格や推測は禁止。"
-        "すべての外部リンクには rel='sponsored noopener nofollow' を付与。"
+        "日本語で、H2中心・短文・正確性重視・煽らないトーン。"
+        "楽天APIで提供された事実のみ使用。価格・在庫は変動前提。"
+        "すべての外部リンクに rel='sponsored noopener nofollow' を付与。"
         "WordPress(AFFINGER)に貼れるよう本文はGutenbergブロックで生成。"
-        "出力は厳密なJSONのみ。余計な文字や説明は禁止。"
-        "JSON schema: "
-        "{"
-        "\"titles\": [string x8],"
-        "\"meta\": {\"slug\": string, \"description\": string, \"intent_map\": [{\"heading\": string, \"query_examples\": [string]}]},"
-        "\"outline\": [{\"h2\": string, \"h3\": [string]}],"
-        "\"body_gutenberg\": string,"
-        "\"table_gutenberg\": string,"
-        "\"ctas\": {\"hesitant\": string, \"decider\": string, \"comparer\": string},"
-        "\"footnotes\": [string],"
-        "\"jsonld\": string,"
-        "\"ogp_prompts\": [string]"
+        "出力は厳密JSONのみ（余計な文字禁止）。"
+        "JSON schema:{"
+        "\"titles\":[string x8],"
+        "\"meta\":{\"slug\":string,\"description\":string,\"intent_map\":[{\"heading\":string,\"query_examples\":[string]}]},"
+        "\"outline\":[{\"h2\":string,\"h3\":[string]}],"
+        "\"body_gutenberg\":string,"
+        "\"jsonld\":string,"
+        "\"ogp_prompts\":[string]"
         "}"
-        "文字数は本文合計でおよそ3000〜5000字。段落は短く。"
+        "本文はおよそ3000〜5000字。段落短め。"
     )
 
 def build_facts_json(kw, items, inputs, policy):
@@ -203,23 +197,22 @@ def build_facts_json(kw, items, inputs, policy):
     }
 
 def user_prompt(facts_json):
-    spec = """
-【目的】
-検索流入と指名流入の両方で読者の意思決定を助け、適切なCTAで離脱せずに比較→選択→購入へ導く記事を作る。
-【厳守事項】一次情報URLの脚注、価格は変動、誇大・断定禁止、開示文を本文冒頭、H2中心で短段落。
-【出力】titles/meta/outline/body_gutenberg/table_gutenberg/ctas/footnotes/jsonld/ogp_prompts（厳密JSON）。
-"""
+    spec = (
+        "【目的】検索/指名流入の意思決定を助け、適切なCTAで比較→選択→購入へ導く。\n"
+        "【厳守】一次情報リンク、価格は変動（断定禁止）、開示文、H2中心で短段落。\n"
+        "【出力】titles/meta/outline/body_gutenberg/jsonld/ogp_prompts（厳密JSON）。\n"
+        "【注意】事実は提供JSONのみ。未記載の数値や推測は禁止。"
+    )
     return ("【事実データ(JSON)】\n" + json.dumps(facts_json, ensure_ascii=False)
-            + "\n\n【仕様書】\n" + spec
-            + "\n【注意】\n- 事実は提供JSONのみ。未記載の数値や主張は書かない。\n- すべてのリンクに rel='sponsored noopener nofollow'。\n- 出力は厳密JSONのみ。")
+            + "\n\n【仕様書】\n" + spec)
 
-# ---------- LLM (with fallback) ----------
-def save_artifacts(prompt_obj, raw, plan):
+# ---------- LLM helpers ----------
+def save_artifacts(prompt_obj, raw, plan, name="llm"):
     try:
-        with open("llm_prompt.json","w",encoding="utf-8") as f: json.dump(prompt_obj,f,ensure_ascii=False,indent=2)
-        with open("llm_output.txt","w",encoding="utf-8") as f: f.write(raw or "")
+        with open(f"{name}_prompt.json","w",encoding="utf-8") as f: json.dump(prompt_obj,f,ensure_ascii=False,indent=2)
+        with open(f"{name}_output.txt","w",encoding="utf-8") as f: f.write(raw or "")
         if plan is not None:
-            with open("llm_plan.json","w",encoding="utf-8") as f: json.dump(plan,f,ensure_ascii=False,indent=2)
+            with open(f"{name}_plan.json","w",encoding="utf-8") as f: json.dump(plan,f,ensure_ascii=False,indent=2)
     except Exception as e:
         LOG.error(f"artifact save failed: {e}")
 
@@ -228,34 +221,26 @@ def is_model_not_found(exc_text:str)->bool:
     t = exc_text.lower()
     return ("model_not_found" in t) or ("does not exist" in t and "model" in t) or ("error code: 404" in t)
 
-def llm_plan_json(kw, items, conf, inputs, policy):
+def llm_call_json(messages, conf, kw, name="llm"):
+    """ 汎用: JSON返却（失敗時フォールバック） """
     if not OPENAI_API_KEY:
-        notify_event("LLM_DISABLED","error", kw,"setup","OPENAI_API_KEY missing")
-        LOG.error("OPENAI_API_KEY missing"); return None
-
+        notify_event("LLM_DISABLED","error", kw,"setup","OPENAI_API_KEY missing"); return None
     client = openai_client()
     llm_cfg = conf.get("llm", {}) if isinstance(conf.get("llm"), dict) else {}
     primary = llm_cfg.get("model", LLM_DEFAULT_MODEL)
-    fallbacks = llm_cfg.get("fallback_models", ["gpt-4o-mini", "gpt-4o", "o4-mini"])
+    fallbacks = llm_cfg.get("fallback_models", ["gpt-4o-mini","gpt-4o","o4-mini"])
     models_to_try = [m for m in [primary] + fallbacks if m]
 
-    facts = build_facts_json(kw, items, inputs, policy)
-    prompt_obj = {"system": sys_prompt(), "user": user_prompt(facts)}
-    raw = ""
-
+    raw, plan = "", None
     for model in models_to_try:
         for attempt in range(1,3):
             try:
                 resp = client.chat.completions.create(
                     model=model, temperature=float(llm_cfg.get("temperature", LLM_TEMPERATURE)),
-                    max_tokens=LLM_MAXTOKENS,
-                    messages=[
-                        {"role":"system","content":prompt_obj["system"]},
-                        {"role":"user","content":prompt_obj["user"]}
-                    ]
+                    max_tokens=LLM_MAXTOKENS, messages=messages
                 )
                 raw = (resp.choices[0].message.content or "").strip()
-                plan = None
+                # JSON取り出し
                 try:
                     plan = json.loads(raw)
                 except Exception:
@@ -263,38 +248,118 @@ def llm_plan_json(kw, items, conf, inputs, policy):
                     if m:
                         try: plan = json.loads(m.group(0))
                         except Exception: plan = None
-                save_artifacts({**prompt_obj, "model_used": model}, raw, plan)
+                save_artifacts({"messages":messages,"model_used":model}, raw, plan, name=name)
                 if plan:
                     if model != primary:
-                        notify_event("LLM_MODEL_FALLBACK","warning", kw,"llm_call",
-                                     f"指定モデルからフォールバックして成功", from_model=primary, to_model=model)
+                        notify_event("LLM_MODEL_FALLBACK","warning", kw,"llm_call","指定モデルからフォールバックして成功",
+                                     from_model=primary, to_model=model)
                     return plan
-                notify_event("LLM_PARSE_ERROR","warning", kw,"llm_call",
-                             "LLM応答をJSONとして解釈できない", attempt=attempt, model=model, sample=raw[:500])
+                # JSONパース失敗→別try
             except Exception as e:
                 et = str(e)
-                notify_event("LLM_CALL_FAILED","error", kw,"llm_call","OpenAI API呼び出しに失敗",
-                             attempt=attempt, model=model, exception=et)
-                # モデル未提供/未権限なら次のモデルへ
-                if is_model_not_found(et):
-                    break
+                # gpt5の404等はここでは通知を出さず、フォールバック成功時だけ知らせる（騒がしくしない）
+                if not is_model_not_found(et):
+                    notify_event("LLM_CALL_FAILED","error", kw,"llm_call","OpenAI API呼び出しに失敗",
+                                 attempt=attempt, model=model, exception=et)
                 time.sleep(2)
-        # 次モデルへ（primaryで404等→fallback通知は成功時に送る）
+        # 次モデルへ
     notify_event("LLM_FAILED_FINAL","error", kw,"llm_call","全モデル試行が失敗")
     return None
 
-# ---------- validate ----------
-def validate_gutenberg(html: str, min_chars:int, max_chars:int):
-    errs=[]
+def llm_plan_json(kw, items, conf, inputs, policy):
+    messages=[
+        {"role":"system","content":sys_prompt()},
+        {"role":"user","content":user_prompt(build_facts_json(kw, items, inputs, policy))}
+    ]
+    return llm_call_json(messages, conf, kw, name="llm")
+
+def llm_expand_body(base_body:str, kw:str, conf, min_chars:int, max_chars:int):
+    """ 本文を増量（Gutenbergのまま拡張） """
+    if not OPENAI_API_KEY: return None
+    client = openai_client()
+    llm_cfg = conf.get("llm", {}) if isinstance(conf.get("llm"), dict) else {}
+    primary = llm_cfg.get("model", LLM_DEFAULT_MODEL)
+    fallbacks = llm_cfg.get("fallback_models", ["gpt-4o-mini","gpt-4o","o4-mini"])
+    models_to_try = [m for m in [primary] + fallbacks if m]
+
+    sysmsg = ("あなたは編集者です。与えられたGutenberg本文を、事実を変えずに"
+              f"{min_chars}〜{max_chars}字の範囲へ増量します。H2中心・短文・逆三角形。"
+              "セクション例: 選び方、比較の見方、深掘り（長所/短所/向く人）、FAQ×5、まとめ。"
+              "誇大・断定は禁止。開示文がなければ先頭に追加。HTML/Gutenbergのみを返す。JSON禁止。")
+    usermsg = ("【元本文（Gutenberg/HTML）】\n" + base_body)
+
+    raw=""
+    for model in models_to_try:
+        try:
+            resp = client.chat.completions.create(
+                model=model, temperature=0.4, max_tokens=LLM_MAXTOKENS,
+                messages=[{"role":"system","content":sysmsg},{"role":"user","content":usermsg}]
+            )
+            raw=(resp.choices[0].message.content or "").strip()
+            with open("llm_expand_output.txt","w",encoding="utf-8") as f: f.write(raw)
+            if model != primary:
+                notify_event("LLM_MODEL_FALLBACK","warning", kw,"llm_expand","指定モデルからフォールバックして成功",
+                             from_model=primary, to_model=model)
+            return raw
+        except Exception as e:
+            et=str(e)
+            if not is_model_not_found(et):
+                notify_event("LLM_CALL_FAILED","error", kw,"llm_expand","OpenAI API呼び出しに失敗",
+                             model=model, exception=et)
+            time.sleep(2)
+    return None
+
+# ---------- validation ----------
+def visible_text_len(html: str)->int:
     text=re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
     text=re.sub(r"<[^>]+>", "", text)
-    L=len(text)
+    return len(text)
+
+def validate_gutenberg(html: str, min_chars:int, max_chars:int):
+    errs=[]
+    L=visible_text_len(html)
     if L<min_chars: errs.append(f"too_short:{L}")
     if L>max_chars: errs.append(f"too_long:{L}")
     if "rel=\"sponsored noopener nofollow\"" not in html: errs.append("missing_rel_sponsored")
-    if html.count("<!-- wp:table")<1: errs.append("missing_table")
-    if html.count("<!-- wp:buttons")<1: errs.append("few_buttons")
+    if "!-- wp:table" not in html: errs.append("missing_table")
+    if "!-- wp:buttons" not in html: errs.append("few_buttons")
     return (len(errs)==0), errs
+
+# ---------- deterministic blocks ----------
+def make_table_block(items):
+    # items: list of dict(name,url,price,review_avg,review_count)
+    rows = []
+    head = "<tr><td>製品名</td><td>ここが強い</td><td>注意点</td><td>指標</td><td>販売ページ</td></tr>"
+    for x in items[:6]:
+        strong = f"レビュー平均{round(x['review_avg'],1)} / {x['review_count']}件"
+        caution = "価格・在庫は変動。保証・返品条件はリンク先で要確認。"
+        metric = f"参考価格: {x['price']}円"
+        link = f"<a href=\"{x['url']}\" rel=\"sponsored noopener nofollow\">楽天で見る</a>"
+        rows.append(f"<tr><td>{x['name']}</td><td>{strong}</td><td>{caution}</td><td>{metric}</td><td>{link}</td></tr>")
+    table = ("<!-- wp:heading --><h2>比較表（要点）</h2><!-- /wp:heading -->\n"
+             "<!-- wp:table --><figure class=\"wp-block-table\"><table>"
+             f"<tbody>{head}{''.join(rows)}</tbody></table></figure><!-- /wp:table -->")
+    return table
+
+def make_cta_buttons(items, title="最終チェックはこちら"):
+    blocks=[]
+    for x in items[:3]:
+        btn = (f"<!-- wp:heading --><h2>{title}</h2><!-- /wp:heading -->\n"
+               "<!-- wp:buttons -->\n<div class=\"wp-block-buttons\">\n"
+               f"<div class=\"wp-block-button\"><a class=\"wp-block-button__link\" href=\"{x['url']}\" "
+               "rel=\"sponsored noopener nofollow\">楽天で詳細を見る（" + x['name'] + "）</a></div>\n"
+               "</div>\n<!-- /wp:buttons -->")
+        blocks.append(btn)
+    return "\n".join(blocks) if blocks else ""
+
+def ensure_disclosure(body, text):
+    if ("アフィリエイト" in body) or ("広告" in body and "アフィ" in body):
+        return body
+    block = ("<!-- wp:paragraph -->"
+             f"<p><em>{text}</em></p>"
+             "<p>価格・在庫・キャンペーンは執筆時点の情報で変動します。リンク先で必ずご確認ください。</p>"
+             "<!-- /wp:paragraph -->")
+    return block + "\n" + body
 
 # ---------- Keywords ----------
 def kw_from_pools(conf, need:int):
@@ -317,14 +382,14 @@ def kw_expand_llm(conf, need:int):
     if not OPENAI_API_KEY:
         notify_event("KW_EXPAND_SKIP","warning","","kw","OPENAI_API_KEY missing")
         return []
-    client = openai_client()
-    themes = (conf.get("keywords") or {}).get("themes") or ["家電","キッチン","日用品","ガジェット","カー用品","子育て","アウトドア","掃除","収納","照明","文房具","防犯"]
-    prompt = (
-        "日本語で、購買意図が強いロングテール商品キーワードを生成してください。"
-        "形式は JSON 配列（文字列のみ）。各キーワードは 12〜30 文字で、具体的な製品名＋用途やスペックを含め、誇大表現は不可。"
-        f"ジャンルの例: {', '.join(themes)}。例: 'コードレス 掃除機 軽量', 'ヘアドライヤー 速乾 静音' など。"
-    )
     try:
+        client = openai_client()
+        themes = (conf.get("keywords") or {}).get("themes") or ["家電","キッチン","日用品","ガジェット","カー用品","子育て","アウトドア","掃除","収納","照明","文房具","防犯"]
+        prompt = (
+            "日本語で、購買意図が強いロングテール商品キーワードをJSON配列で生成。"
+            "各キーワードは12〜30文字で、具体的な製品名＋用途やスペックを含める。誇大表現禁止。"
+            f"ジャンル例: {', '.join(themes)}。例: 'コードレス 掃除機 軽量', 'ヘアドライヤー 速乾 静音'。"
+        )
         resp = client.chat.completions.create(
             model=(conf.get("llm",{}) or {}).get("model", LLM_DEFAULT_MODEL),
             temperature=0.5, max_tokens=800,
@@ -439,28 +504,36 @@ def main():
             LOG.info(f"skip thin (<{min_items}) for '{kw}'")
             continue
 
+        # 1) LLM本文（JSON）
         plan = llm_plan_json(kw, after_review, conf, inputs, policy)
         if not plan or not isinstance(plan, dict) or not plan.get("body_gutenberg"):
             continue
 
+        # 2) 本文組み立て + 必須ブロック（表/CTA）を確実に付与
         body = plan["body_gutenberg"]
-        if plan.get("table_gutenberg"): body += "\n" + plan["table_gutenberg"]
-        if plan.get("ctas"):
-            for k in ("hesitant","decider","comparer"):
-                v = plan["ctas"].get(k); 
-                if v: body += "\n" + v
-        if plan.get("footnotes"):
-            body += "\n<!-- wp:heading --><h2>参考・出典</h2><!-- /wp:heading -->"
-            lis = "".join([f"<li><a href=\"{u}\" rel=\"sponsored noopener nofollow\">{u}</a></li>" for u in plan["footnotes"]])
-            body += f"<!-- wp:list --><ul>{lis}</ul><!-- /wp:list -->"
-        if plan.get("jsonld"):
-            body += f"\n<!-- wp:html --><script type=\"application/ld+json\">{plan['jsonld']}</script><!-- /wp:html -->"
+        body = ensure_disclosure(body, disclosure)
 
-        titles = plan.get("titles") or []
-        meta = plan.get("meta") or {}
-        title = titles[0] if titles else f"{kw}のおすすめ{min(10,len(after_review))}選"
-        excerpt = meta.get("description") or "価格は変動。詳細はリンク先で確認。"
+        table_block = make_table_block(after_review)
+        cta_block = make_cta_buttons(after_review, title="迷ったら上位候補をチェック")
 
+        # LLMの表やCTAが無くてもこちらで必ず付ける
+        body += "\n" + table_block + "\n" + cta_block
+
+        # 3) 文字数不足ならLLMで増量（最大EXPAND_TRIES回）
+        for _ in range(EXPAND_TRIES):
+            ok, errs = validate_gutenberg(body, TARGET_MIN_CHARS, TARGET_MAX_CHARS)
+            if ok: break
+            needs_len = any(e.startswith("too_short") for e in errs)
+            if needs_len:
+                expanded = llm_expand_body(body, kw, conf, TARGET_MIN_CHARS, TARGET_MAX_CHARS)
+                if expanded and visible_text_len(expanded) > visible_text_len(body):
+                    body = expanded
+                else:
+                    break
+            else:
+                break
+
+        # 最終検証
         ok, errs = validate_gutenberg(body, TARGET_MIN_CHARS, TARGET_MAX_CHARS)
         if not ok:
             notify_event("VALIDATION_FAILED","warning", kw,"validation","本文検証NG", errors=errs)
@@ -471,6 +544,11 @@ def main():
             notify_event("BLOCKED_BY_RULE","warning", kw,"rule","法務/NG語に該当")
             LOG.info(f"blocked by rule for '{kw}'")
             continue
+
+        titles = plan.get("titles") or []
+        title = titles[0] if titles else f"{kw}のおすすめ{min(10,len(after_review))}選"
+        meta = plan.get("meta") or {}
+        excerpt = meta.get("description") or "価格は変動。詳細はリンク先で確認。"
 
         payload={"title":title,"slug":slug,"status":"publish",
                  "content":body,"categories":cats,"excerpt":excerpt}
