@@ -308,3 +308,102 @@ def wp_post(title:str, content_md:str, slug_hint:str, categories:List[str])->boo
     term_ids = []
     try:
         rc = requests.get(f"{WP_SITE_URL}/wp-json/wp/v2/categories",
+                          params={"per_page":100}, timeout=20, auth=(WP_USERNAME, WP_APP_PASSWORD))
+        if rc.ok:
+            cats = {c["name"]:c["id"] for c in rc.json()}
+            for cn in categories:
+                if cn in cats: term_ids.append(cats[cn])
+    except Exception as e:
+        logging.warning(f"wp_cat_fetch_warn: {e}")
+
+    payload = {"title": title, "content": content_md, "status": "publish", "slug": slug}
+    if term_ids: payload["categories"] = term_ids
+
+    logging.info(f"wp_post_try: title='{title[:30]}' slug='{slug}'")
+    r = requests.post(f"{WP_SITE_URL}/wp-json/wp/v2/posts",
+                      json=payload, timeout=40, auth=(WP_USERNAME, WP_APP_PASSWORD))
+    if not r.ok:
+        logging.error(f"wp_post_fail: http={r.status_code} resp={r.text[:400]}")
+        alert("WP_POST_FAILED","error",{"kw":title,"stage":"publish","http":r.status_code,"resp":r.text[:400]})
+        return False
+    logging.info(f"wp_post_ok: id={r.json().get('id')} slug={slug}")
+    return True
+
+# ============ Generate ============
+def generate_article(kw:str, items:List[Dict[str,Any]])->Optional[str]:
+    system = {"role":"system","content":BASE_SPEC}
+    user = {"role":"user","content":build_user_prompt(kw, items, CONFIG["site"]["affiliate_disclosure"])}
+    model = CONFIG["llm"]["model"]
+
+    # 1st try
+    md = llm_chat(model, [system, user], "llm_call", kw, max_tokens=2400, temperature=CONFIG["llm"]["temperature"])
+    if md and md.strip():
+        errs = validate(md)
+        if not errs:
+            return md
+        alert("VALIDATION_FAILED","warning",{"kw":kw,"stage":"validation","errors":errs})
+
+        # 強制追記プロンプト
+        fix_user = {"role":"user","content":build_force_prompt(errs)}
+        md2 = llm_chat(model, [system, {"role":"assistant","content":md}, fix_user],
+                       "llm_repair", kw, max_tokens=1400, temperature=CONFIG["llm"]["temperature"])
+        if md2 and md2.strip():
+            return md2
+
+    # 本文が空/拒否のとき
+    alert("LLM_EMPTY_COMPLETION","error",{
+        "kw": kw, "stage": "llm_call", "reason": "content-empty-or-refusal"
+    })
+    # フォース生成（簡略版）もう一度だけ
+    force_user = {"role":"user","content":
+        "先の指示通り、Markdown本文のみで完全な記事を出力。見出し(H2中心)、比較表とCTA3つ以上必須。"
+    }
+    md3 = llm_chat(model, [system, user, force_user], "llm_force", kw, max_tokens=2400, temperature=CONFIG["llm"]["temperature"])
+    return md3 if (md3 and md3.strip()) else None
+
+# ============ Main ============
+def main():
+    try:
+        if not check_wp_auth():
+            logging.info("abort: wp_auth_failed")
+            return
+
+        seeds = expand_keywords()
+        if not seeds:
+            alert("KW_EMPTY","error",{"kw":"","stage":"kw","reason":"キーワードが空"})
+            return
+
+        posted = 0
+        max_posts = CONFIG["site"]["posts_per_run"]
+        cats = CONFIG["site"].get("category_names", ["レビュー"])
+
+        for kw in seeds:
+            if posted >= max_posts: break
+
+            logging.info(f"query kw='{kw}'")
+            items = rakuten_items(kw, max_total=CONFIG["data_sources"]["rakuten"]["max_per_seed"])
+            good = filter_items(items)
+            logging.info(f"stats kw='{kw}': total={len(items)}, after_filters={len(good)}")
+
+            if len(good) < CONFIG["content"]["min_items"]:
+                logging.info(f"skip thin (<{CONFIG['content']['min_items']}) for '{kw}'")
+                continue
+
+            md = generate_article(kw, good)
+            if not (md and md.strip()):
+                logging.info(f"skip no-md for '{kw}'")
+                continue
+
+            title = f"{kw}のおすすめ比較【失敗しにくい選び方と注意点】"
+            ok = wp_post(title, md, slug_hint=kw, categories=cats)
+            if ok:
+                posted += 1
+
+        logging.info(f"done, posted={posted}")
+    except Exception as e:
+        logging.exception("run_failed")
+        alert("RUN_FAILED","error",{"kw":"","stage":"run","reason":"未捕捉の例外","exception":str(e)})
+        raise
+
+if __name__ == "__main__":
+    main()
