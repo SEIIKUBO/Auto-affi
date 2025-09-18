@@ -1,23 +1,9 @@
 site:
-  posts_per_run: 3        # ← ここを 3〜5 に
-  category_names: ["レビュー", "おすすめ"]
-
-keywords:
-  seeds:
-    - "モバイルバッテリー 10000mAh PD"
-    - "Anker 65W 充電器"
-    - "USB-C ドッキングステーション"
-    - "電動歯ブラシ 替えブラシ オーラルB"
-
+  posts_per_run: 1
+  category_names: ["レビュー"]
+  affiliate_disclosure: "当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。"
+  unique_slug_date: true          # ← 重複時に -YYYYMMDD を付与（今回のボトルネック解消）
 data_sources:
   rakuten:
     endpoint: "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601"
-    max_per_seed: 50      # ← 30→50 に増やすと候補が厚くなる
-
-content:
-  min_items: 3            # ← 厚み確保。薄いなら 2 まで緩和
-  price_floor: 800        # ← 価格下限。厳しすぎたら下げる
-  review_floor: 3.8       # ← 平均評価下限。厳しすぎたら 3.6–3.7
-  ab_test: true
-review:
-  rules_file: "src/review_rules.yaml"   # NG語が厳しすぎるなら中身を見直し
+    max_per_seed: 100             # ← 設定は100でもOK。コード側で30件ごと自動ページング
