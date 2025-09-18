@@ -1,9 +1,81 @@
 site:
-  posts_per_run: 1
-  category_names: ["レビュー"]
+  posts_per_run: 2
+  category_names: ["レビュー", "おすすめ"]
   affiliate_disclosure: "当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。"
-  unique_slug_date: true          # ← 重複時に -YYYYMMDD を付与（今回のボトルネック解消）
+  unique_slug_date: true
+  internal_link: ""
+
+keywords:
+  mode: pools              # static | pools | expand_llm
+  max_candidates: 20       # 1Runで検討する候補の上限（投稿本数の数倍を推奨）
+  seeds:
+    - "USB-C ドッキングステーション"   # staticでも使えるように残してOK
+  pools:
+    nouns:                 # 多ジャンル（必要に応じて編集）
+      - "ヘアドライヤー"
+      - "布団乾燥機"
+      - "加湿器"
+      - "空気清浄機"
+      - "電動歯ブラシ"
+      - "オーブントースター"
+      - "炊飯器"
+      - "コーヒーメーカー"
+      - "ホットサンドメーカー"
+      - "電気ケトル"
+      - "ゲーミングマウス"
+      - "ゲーミングキーボード"
+      - "モニターライト"
+      - "外付けSSD"
+      - "モバイルバッテリー"
+      - "USB充電器"
+      - "ロボット掃除機"
+      - "ポータブル電源"
+      - "ドライブレコーダー"
+      - "ベビーモニター"
+    modifiers:
+      - "おすすめ"
+      - "比較"
+      - "コスパ"
+      - "静音"
+      - "小型"
+      - "一人暮らし"
+      - "初心者向け"
+      - "日本メーカー"
+      - "大容量"
+    specs:
+      - "急速充電"
+      - "省エネ"
+      - "軽量"
+      - "多機能"
+      - "Wi-Fi対応"
+  themes:                  # expand_llm 用（任意）
+    - "家電"
+    - "キッチン"
+    - "日用品"
+    - "ガジェット"
+    - "カー用品"
+    - "子育て"
+    - "アウトドア"
+    - "掃除"
+    - "収納"
+    - "照明"
+    - "文房具"
+    - "防犯"
+
 data_sources:
   rakuten:
     endpoint: "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601"
-    max_per_seed: 100             # ← 設定は100でもOK。コード側で30件ごと自動ページング
+    max_per_seed: 90       # 30件/頁の自動ページングで取得
+
+content:
+  min_items: 2
+  price_floor: 500
+  review_floor: 3.5
+  ab_test: false
+
+review:
+  rules_file: "src/review_rules.yaml"
+
+llm:
+  model: "gpt5"            # ← ここを "gpt5" に。無効なら Discord に LLM_CALL_FAILED を通知して投稿しません
+  temperature: 0.4
