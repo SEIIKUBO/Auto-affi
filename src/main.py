@@ -1,31 +1,43 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-import os, sys, json, re, logging
+import os, sys, json, time, math, base64, logging, traceback, textwrap
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional
-
-import requests
-import yaml
+import requests, yaml
 from slugify import slugify
-from openai import OpenAI
+from urllib.parse import urlencode
 
-# ============ Logging ============
-LOG_FILE = "run.log"
+"""
+gpt-5 最適化版（Responses API）
+- すべてのLLM呼び出しを Responses API に寄せる
+- gpt-5 で empty_completion / パラメタ不一致が出たら自動で gpt-4o → gpt-4o-mini にフォールバック
+- テンプレ出力は廃止（AI失敗時は投稿しない＋Discord通知のみ）
+- AFFINGER向けCTAボタン必須、Markdown表必須、最小文字数チェック
+- Rakuten API: hits<=30 厳守、400時は理由をDiscordへ
+- ログ: run.log、Discordは“コピペで判断できるJSON本文”を送信
+"""
+
+# --------------- ログ設定 ---------------
 logging.basicConfig(
-    filename=LOG_FILE,
+    filename='run.log',
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format='%(asctime)s %(levelname)s %(message)s'
 )
+JST = timezone(timedelta(hours=9))
 
+# --------------- 環境変数 ---------------
+RAKUTEN_APP_ID   = os.getenv("RAKUTEN_APP_ID", "").strip()
+WP_SITE_URL      = os.getenv("WP_SITE_URL", "").rstrip("/")
+WP_USERNAME      = os.getenv("WP_USERNAME", "")
+WP_APP_PASSWORD  = os.getenv("WP_APP_PASSWORD", "")
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+ALERT_WEBHOOK    = os.getenv("ALERT_WEBHOOK_URL", "")
+
+# --------------- ヘルパ ---------------
 def jst_now_iso():
-    return datetime.now(timezone(timedelta(hours=9))).isoformat()
+    return datetime.now(JST).isoformat()
 
-# ============ Discord Alert ============
-ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
-
-def alert(event: str, severity: str, payload: Dict[str, Any]):
-    if not ALERT_WEBHOOK_URL:
+def alert(event, severity, payload):
+    """DiscordにJSONを投げる。本文は見れば状況が一発でわかる形にする。"""
+    if not ALERT_WEBHOOK:
         return
     base = {
         "event": event,
@@ -38,372 +50,423 @@ def alert(event: str, severity: str, payload: Dict[str, Any]):
             "run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""),
             "branch": os.getenv("GITHUB_REF_NAME", ""),
             "sha": os.getenv("GITHUB_SHA", ""),
-            "run_url": f"https://github.com/{os.getenv('GITHUB_REPOSITORY','')}/actions/runs/{os.getenv('GITHUB_RUN_ID','')}",
-        },
+            "run_url": f"https://github.com/{os.getenv('GITHUB_REPOSITORY','')}/actions/runs/{os.getenv('GITHUB_RUN_ID','')}"
+        }
     }
     base.update(payload or {})
-    head = f"[AUTO-REV][{severity.upper()}] EVENT={event} KW=\"{base.get('kw','')}\""
     try:
-        requests.post(ALERT_WEBHOOK_URL, json={
-            "content": head + "\n```json\n" + json.dumps(base, ensure_ascii=False, indent=2) + "\n```"
-        }, timeout=15)
-    except Exception as e:
-        logging.error(f"alert_failed: {e}")
+        title = f"[AUTO-REV][{severity.upper()}] EVENT={event}"
+        content = title + "\n" + "```json\n" + json.dumps(base, ensure_ascii=False, indent=2) + "\n```"
+        requests.post(ALERT_WEBHOOK, json={"content": content}, timeout=15)
+    except Exception:
+        logging.exception("alert_failed")
 
-# ============ Config ============
-def load_config(path="config/app.yaml")->Dict[str,Any]:
+def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    cfg.setdefault("site", {}).setdefault("posts_per_run", 1)
-    cfg["site"].setdefault("affiliate_disclosure", "当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。")
-    cfg.setdefault("llm", {}).setdefault("model", "gpt-4o-mini")
-    cfg["llm"].setdefault("fallback_models", ["gpt-4o","gpt-4o-mini"])
-    cfg["llm"].setdefault("temperature", 0.4)
-    cfg.setdefault("content", {}).setdefault("min_items", 3)
-    cfg["content"].setdefault("price_floor", 2000)
-    cfg["content"].setdefault("review_floor", 3.8)
-    cfg["content"].setdefault("min_chars", 1800)
-    cfg.setdefault("keywords", {}).setdefault("mode", "expand_llm")
-    cfg["keywords"].setdefault("max_candidates", 30)
-    cfg.setdefault("data_sources", {}).setdefault("rakuten", {
-        "endpoint":"https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601",
-        "max_per_seed":60
-    })
-    cfg.setdefault("site", {}).setdefault("category_names", ["レビュー"])
+    # 必須の開示文が未設定なら警告し、デフォルト適用（投稿は継続）
+    if not cfg.get("site", {}).get("affiliate_disclosure"):
+        alert("CONFIG_DEFAULTED", "warning", {
+            "kw": "",
+            "stage": "setup",
+            "reason": "site.affiliate_disclosure が未設定のためデフォルトを適用",
+            "defaults": {"affiliate_disclosure": "当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。"}
+        })
+        cfg.setdefault("site", {})["affiliate_disclosure"] = "当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。"
     return cfg
 
-CONFIG = load_config()
+# -------- WordPress --------
+def wp_auth_header():
+    token = base64.b64encode(f"{WP_USERNAME}:{WP_APP_PASSWORD}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
 
-# ============ OpenAI wrapper ============
-_openai = OpenAI()
-
-def _is_reasoning_like(model:str)->bool:
-    m = model.lower()
-    return m.startswith("gpt-5") or m.startswith("o")
-
-def _extract_text(resp) -> str:
-    """
-    Chat Completions の choice から安全にテキストを引く。
-    content が None/空なら空文字を返す（呼び出し側で判定）。
-    """
+def wp_check_auth():
     try:
-        choice = resp.choices[0]
-        msg = choice.message
-        text = getattr(msg, "content", None)
-        if text is None:
-            # 一部モデルは refusal や tool_calls を返す場合がある
-            # ここでは空文字扱いにして上位でリトライ/フォールバックする
-            return ""
-        return str(text)
-    except Exception:
-        return ""
-
-def llm_chat(model:str, messages:List[Dict[str,str]], purpose:str, kw:str,
-             max_tokens:int=2200, temperature:float=0.4) -> Optional[str]:
-    """
-    - reasoning系 (gpt-5など): max_completion_tokens を使用
-    - それ以外: max_tokens を使用
-    - content が空のときは例外を投げてフォールバックさせる
-    """
-    def _try(mdl:str, allow_temp:bool)->str:
-        kwargs: Dict[str,Any] = dict(model=mdl, messages=messages)
-        if _is_reasoning_like(mdl):
-            kwargs["max_completion_tokens"] = max_tokens
-            if allow_temp and not mdl.lower().startswith("gpt-5"):
-                kwargs["temperature"] = temperature
+        r = requests.get(f"{WP_SITE_URL}/wp-json/wp/v2/users/me", headers=wp_auth_header(), timeout=20)
+        if r.status_code == 200:
+            user = r.json().get("name","?")
+            logging.info(f"wp_auth_ok: user={user}")
+            return True
         else:
-            kwargs["max_tokens"] = max_tokens
-            kwargs["temperature"] = temperature
-        resp = _openai.chat.completions.create(**kwargs)
-        text = _extract_text(resp)
-        if not text or not text.strip():
+            alert("WP_AUTH_FAILED", "error", {
+                "stage": "wp_auth",
+                "reason": f"HTTP {r.status_code}",
+                "resp": r.text[:400]
+            })
+            return False
+    except Exception as e:
+        alert("WP_AUTH_FAILED", "error", {
+            "stage": "wp_auth",
+            "exception": repr(e)
+        })
+        return False
+
+def wp_slug_exists(slug):
+    try:
+        r = requests.get(f"{WP_SITE_URL}/wp-json/wp/v2/posts?slug={slug}", headers=wp_auth_header(), timeout=25)
+        if r.status_code == 200:
+            arr = r.json()
+            return len(arr) > 0
+        return False
+    except Exception:
+        return False
+
+def wp_publish(title, content_md, slug, status="publish", categories=None, tags=None):
+    data = {
+        "title": title,
+        "content": content_md,
+        "slug": slug,
+        "status": status
+    }
+    if categories: data["categories"] = categories
+    if tags: data["tags"] = tags
+    try:
+        r = requests.post(f"{WP_SITE_URL}/wp-json/wp/v2/posts", headers={
+            **wp_auth_header(),
+            "Content-Type": "application/json"
+        }, data=json.dumps(data), timeout=40)
+        if r.status_code in (200,201):
+            return True, r.json()
+        else:
+            logging.error(f"http_error: POST .../posts -> {r.status_code} {r.text[:400]}")
+            alert("WP_POST_FAILED", "error", {
+                "stage": "publish",
+                "reason": f"HTTP {r.status_code}",
+                "resp": r.text[:400]
+            })
+            return False, r.text
+    except Exception as e:
+        alert("WP_POST_FAILED", "error", {
+            "stage": "publish",
+            "exception": repr(e)
+        })
+        return False, repr(e)
+
+# -------- Rakuten API --------
+RAKUTEN_ENDPOINT = "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601"
+
+def rakuten_items(keyword, hits=30):
+    params = {
+        "applicationId": RAKUTEN_APP_ID,
+        "keyword": keyword,
+        "hits": min(int(hits), 30),   # 30超は400
+        "page": 1,
+        "format": "json",
+        "availability": 1,
+        "sort": "-reviewCount"
+    }
+    try:
+        r = requests.get(RAKUTEN_ENDPOINT, params=params, timeout=30)
+        if r.status_code != 200:
+            alert("RAKUTEN_API_ERROR", "error", {
+                "kw": keyword,
+                "stage": "fetch",
+                "reason": f"HTTP {r.status_code}",
+                "resp": r.text[:400]
+            })
+            return []
+        j = r.json()
+        items = j.get("Items", [])
+        res = []
+        for it in items:
+            i = it.get("Item", {})
+            res.append({
+                "name": i.get("itemName",""),
+                "url": i.get("itemUrl",""),
+                "price": i.get("itemPrice", 0),
+                "shop": i.get("shopName",""),
+                "review_count": i.get("reviewCount",0),
+                "review_avg": i.get("reviewAverage",0),
+                "caption": i.get("itemCaption","")[:200]
+            })
+        return res
+    except Exception as e:
+        alert("RAKUTEN_API_ERROR", "error", {
+            "kw": keyword,
+            "stage": "fetch",
+            "exception": repr(e)
+        })
+        return []
+
+def filter_items(items, cfg):
+    min_rev = cfg["rakuten"].get("min_review_count", 10)
+    min_price = cfg["rakuten"].get("min_price", 0)
+    max_price = cfg["rakuten"].get("max_price", 10**9)
+    out = [x for x in items if x["review_count"] >= min_rev and min_price <= x["price"] <= max_price]
+    return out
+
+# -------- OpenAI（Responses API + フォールバック） --------
+class LLMClient:
+    def __init__(self, cfg):
+        self.model_primary = cfg["llm"].get("model","gpt-4o")
+        self.fallback_models = cfg["llm"].get("fallback_models", ["gpt-4o", "gpt-4o-mini"])
+        self.temperature = float(cfg["llm"].get("temperature", 0.4))
+        self.max_output_tokens = int(cfg["llm"].get("max_output_tokens", 6000))
+        self.timeout = int(cfg["llm"].get("timeout_sec", 120))
+        if not OPENAI_API_KEY:
+            alert("LLM_NOT_CONFIGURED", "error", {
+                "stage": "setup",
+                "reason": "OPENAI_API_KEY 未設定"
+            })
+            raise RuntimeError("OPENAI_API_KEY missing")
+        self.base_url = "https://api.openai.com/v1"
+
+    def _responses_call(self, prompt, model):
+        url = f"{self.base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        body = {
+            "model": model,
+            "input": prompt,
+            "temperature": self.temperature,
+            "max_output_tokens": self.max_output_tokens,
+            "response_format": {"type": "text"}
+        }
+        r = requests.post(url, headers=headers, data=json.dumps(body), timeout=self.timeout)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code} - {r.text[:400]}")
+        data = r.json()
+        # 安全にテキスト抽出（output_text優先、なければ掘る）
+        text = data.get("output_text")
+        if not text:
+            # fallback extraction
+            try:
+                outs = data.get("output", [])
+                chunks = []
+                for out in outs:
+                    for c in out.get("content", []):
+                        if c.get("type") in ("output_text","text"):
+                            chunks.append(c.get("text",""))
+                text = "\n".join(chunks).strip()
+            except Exception:
+                text = ""
+        if not text.strip():
             raise ValueError("empty_completion")
         return text
 
-    try:
-        try:
-            return _try(model, allow_temp=True)
-        except Exception as e1:
-            em = str(e1)
-            # パラメータ系の自動切替（max_tokens→max_completion_tokens / temperature除去）
-            if "Unsupported parameter" in em and "temperature" in em:
-                return _try(model, allow_temp=False)
-            if "max_tokens" in em and "max_completion_tokens" in em:
-                return _try(model, allow_temp=True)
-            raise e1
-    except Exception as e:
-        alert("LLM_CALL_FAILED", "error", {
-            "kw": kw, "stage": purpose, "model": model, "exception": f"{type(e).__name__}: {e}"
-        })
-        for fb in CONFIG["llm"].get("fallback_models", []):
+    def complete(self, prompt):
+        # primary → fallbacks
+        tried = []
+        for model in [self.model_primary] + self.fallback_models:
             try:
-                alert("LLM_MODEL_FALLBACK", "warning", {"kw": kw, "from_model": model, "to_model": fb})
-                return _try(fb, allow_temp=True)
-            except Exception as e2:
-                alert("LLM_FALLBACK_ATTEMPT", "warning", {"kw": kw, "from": model, "to": fb, "exception": f"{type(e2).__name__}: {e2}"})
-                continue
-        alert("LLM_FAILED_FINAL", "error", {"kw": kw, "stage": purpose})
-        return None
+                txt = self._responses_call(prompt, model)
+                if model != self.model_primary:
+                    alert("LLM_MODEL_FALLBACK", "warning", {
+                        "from_model": self.model_primary,
+                        "to_model": model
+                    })
+                return txt, model
+            except Exception as e:
+                tried.append({"model": model, "exception": repr(e)})
+                alert("LLM_CALL_FAILED", "error", {
+                    "stage": "llm_call",
+                    "model": model,
+                    "exception": repr(e)
+                })
+                time.sleep(1.2)
+        # 全滅
+        raise RuntimeError(f"LLM failed: {tried}")
 
-# ============ Rakuten ============
-RAKUTEN_APP_ID = os.getenv("RAKUTEN_APP_ID","")
+# -------- コンテンツ生成 --------
+PROMPT_SPEC = """あなたは「一次情報最優先・法令順守のアフィリエイト記事ライター兼編集者」です。
+日本語で、H2中心の構成・正確性重視・不必要に煽らないトーンで執筆してください。
 
-def rakuten_items(keyword:str, max_total:int=60)->List[Dict[str,Any]]:
-    url = CONFIG["data_sources"]["rakuten"]["endpoint"]
-    out: List[Dict[str,Any]] = []
-    page = 1
-    while len(out) < max_total and page <= 3:
-        hits = min(30, max_total - len(out))
-        params = {
-            "applicationId": RAKUTEN_APP_ID,
-            "keyword": keyword,
-            "hits": hits,
-            "page": page,
-            "formatVersion": 2,
-            "sort": "-reviewCount",
-        }
-        r = requests.get(url, params=params, timeout=25)
-        if r.status_code == 400:
-            alert("RAKUTEN_API_ERROR","error",{"kw":keyword,"stage":"fetch","reason":r.text})
-            break
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("Items", [])
-        out.extend(items)
-        if len(items) < hits: break
-        page += 1
-    return out
+【目的】
+検索流入と指名流入の両方で読者の意思決定を助け、適切なCTAで離脱せずに比較→選択→購入へ導く記事を作る。
 
-def filter_items(items:List[Dict[str,Any]])->List[Dict[str,Any]]:
-    pf = CONFIG["content"]["price_floor"]
-    rf = CONFIG["content"]["review_floor"]
-    ok = []
-    for it in items:
-        try:
-            if int(it.get("itemPrice",0)) >= pf and float(it.get("reviewAverage",0) or 0) >= rf:
-                ok.append(it)
-        except Exception:
-            continue
-    return ok
+【読者像】
+- 読者タイプ: 初心者
+- 主要ニーズ: コスパが良く失敗しにくいものだけ知りたい
+- シチュエーション: 一人暮らし/家族
 
-# ============ Validators ============
-def has_table(md:str)->bool:
-    return bool(re.search(r"^\|?\s*製品名\s*\|", md, flags=re.MULTILINE))
+【入力（供給データ）】
+- 記事タイプ: 比較まとめ/ランキング/用途別おすすめ
+- 注意点/除外: 医療・効果の断定表現を禁止、未確定の価格は書かない
+- 競合比較の軸（参考）: 耐久性/保証/カラバリ/追加オプション/流通度合い/話題性
+- 内部リンク予定: 省略可
 
-def count_cta(md:str)->int:
-    return len(re.findall(r"\[(?:購入はこちら|公式サイト|比較表を見る|最安をチェック|楽天で見る)\]\([^)]+\)", md))
+【厳守事項】
+1) 事実は一次情報（正規販売ページ=楽天の該当商品ページ、メーカー公式）に依拠。本文末に脚注でURL列挙。捏造しない。
+2) 価格・在庫・キャンペーンは変動前提。「執筆時点」表現と注意書きを必ず入れる。最安や断定表現は禁止。
+3) 比較は公正・具体。欠点も必ず記載。誇大・医療/効果効能の断定・体験の一般化をしない。
+4) 冒頭直後に開示文：『当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。』
+5) H2中心、段落短め、箇条書き多め。逆三角形（結論→理由→具体）。1文は短く。Markdownで。
+6) 必須: Markdownの比較表（|を使う）。CTAブロック3種（迷っている/即決/さらに比較）。AFFINGERボタン短コードを使う。
+   例: [st-mybutton url="{URL}" title="楽天で価格を見る" rel="nofollow" target="_blank" class="stmybtn st-color"]楽天で価格を見る[/st-mybutton]
 
-def validate(md:str)->List[str]:
-    errs = []
-    if len(md) < CONFIG["content"]["min_chars"]:
-        errs.append(f"too_short:{len(md)}")
-    if not has_table(md):
-        errs.append("missing_table")
-    if count_cta(md) < 3:
-        errs.append("few_buttons")
-    return errs
+【出力仕様】
+- 1500〜3000字。H2/H3を適切に。
+- 「文字以外の要素」を一定間隔で（表・箇条書き・引用など）。
+- 本文末に「脚注:」として参照URLを列挙。
 
-# ============ Keyword expand ============
-def expand_keywords()->List[str]:
-    mode = CONFIG.get("keywords",{}).get("mode","seeds")
-    seeds = CONFIG.get("keywords",{}).get("seeds",[]) or []
-    if mode != "expand_llm" or not seeds:
-        return seeds
+【対象カテゴリ/キーワード】
+{KW}
 
-    pools = CONFIG["keywords"].get("pools",{})
-    nouns = pools.get("nouns",[])
-    modifiers = pools.get("modifiers",[])
-    specs = pools.get("specs",[])
-    max_cand = CONFIG["keywords"].get("max_candidates",30)
+【比較候補（楽天公式/正規販売ページが優先）】
+以下の候補を事実の根拠として使い、名称・参考価格（変動注意）・レビュー傾向を要約。URLは脚注にも列挙。
+{ITEMS}
 
-    system = {"role":"system","content":"日本語のロングテール商品キーワードを作るアナリスト。購買に近い語を優先。"}
-    user = {"role":"user","content":(
-        "以下の要素から、自然な日本語キーワードを箇条書きで最大{n}件。1行1キーワードのみ、前後に余計な文や記号は書かない。\n"
-        "- シード: {seeds}\n- 名詞群: {nouns}\n- 修飾語: {mods}\n- 仕様語: {specs}\n"
-        "NG: 医療効能/誇大/曖昧メーカー名"
-    ).format(n=max_cand, seeds=", ".join(seeds), nouns=", ".join(nouns), mods=", ".join(modifiers), specs=", ".join(specs))}
+【サイト設定】
+開示文: {DISCLOSURE}
 
-    model = CONFIG["llm"]["model"]
-    text = llm_chat(model, [system, user], "kw", kw="", max_tokens=600, temperature=0.2)
-    if not text:
-        alert("KW_EXPAND_FAILED","warning",{"kw":"","stage":"kw","reason":"LLMでのキーワード拡張に失敗"})
-        return seeds
-
-    out = []
-    for line in text.splitlines():
-        s = line.strip()
-        s = s.lstrip("-•* \t").strip()
-        if not s: continue
-        if len(s) > 40: continue
-        if s not in out: out.append(s)
-    if not out:
-        alert("KW_EXPAND_PARSE_EMPTY","warning",{"kw":"","stage":"kw","reason":"拡張結果が空（解析後）"})
-        return seeds
-
-    uniq = []
-    for x in seeds + out:
-        if x not in uniq:
-            uniq.append(x)
-    return uniq[:max_cand]
-
-# ============ Article prompts ============
-BASE_SPEC = """
-あなたは「一次情報最優先・法令順守のアフィリエイト記事ライター兼編集者」です。
-H2中心・短文多め・結論→理由→具体例。誇大/断定NG。価格/在庫は変動前提で「執筆時点」注意書き。
-
-必須:
-- 2000〜3500字（不足なら追記）
-- 比較表（列=製品名|ここが強い|注意点|重さ/サイズ|主な指標|公式参考リンク）
-- CTAリンク3つ以上（例: [購入はこちら](URL), [公式サイト](URL), [比較表を見る](#)）
-- 末尾に脚注（一次情報URL）
-- 冒頭または直後に開示文を掲載
-出力はMarkdown本文のみ。前置きやコードブロックは不要。
+以上を満たす記事本文（Markdownのみ出力。余計な前置きや説明は書かない）を生成してください。
 """
 
-USER_SPEC = """
-【記事タイプ】比較まとめ/用途別おすすめ
-【注意】医療・効果断定禁止。価格は『執筆時点の参考価格』と明記。
-【開示文】{disclosure}
-"""
-
-def build_user_prompt(kw:str, items:List[Dict[str,Any]], disclosure:str)->str:
-    lines = [f"# テーマ: {kw}", "", "【比較対象（一次情報の参考）】"]
-    for it in items[:6]:
-        lines.append(f"- {it.get('itemName','')[:80]} | 参考: {it.get('itemUrl','')} | 価格目安:{it.get('itemPrice','')}円 | レビュー:{it.get('reviewAverage','')}")
-    lines.append(USER_SPEC.format(disclosure=disclosure))
+def build_items_block(items):
+    lines = []
+    for i, it in enumerate(items, 1):
+        lines.append(f"- {i}. {it['name']} | 参考価格: {it['price']}円（変動あり） | レビュー: {it['review_avg']} / {it['review_count']}件 | 販売: {it['shop']}\n  URL: {it['url']}")
     return "\n".join(lines)
 
-def build_force_prompt(errs:List[str])->str:
-    return (
-        "上記の原稿は要件不足です。以下を必ず満たす完全版Markdown本文のみを出力してください。\n"
-        f"- 不足: {', '.join(errs)}\n"
-        "- 必須: 指定の比較表, CTA3つ以上, 『執筆時点』注意, 脚注URL, 2000字以上\n"
-        "- 余分な前置き/謝罪/コードブロック禁止"
+def validate_markdown(md, cfg):
+    min_chars = int(cfg["content"].get("min_chars", 2000))
+    need_tables = int(cfg["content"].get("require_tables", 1))
+    need_buttons = int(cfg["content"].get("require_buttons", 3))
+
+    text = md.strip()
+    if len(text) < min_chars:
+        return False, f"too_short:{len(text)}"
+    # 見出し
+    if "## " not in text:
+        return False, "missing_h2"
+    # 表（|記号をざっくり検査）
+    if text.count("|") < (need_tables * 8):  # 1表=最低8個ぐらいの'|'を想定
+        return False, "missing_table"
+    # AFFINGERボタン
+    if text.count("[st-mybutton") < need_buttons:
+        return False, "few_buttons"
+    return True, "ok"
+
+def make_slug(title):
+    # 日本語タイトル想定→ローマ字風slug化。重複回避は呼び出し側で。
+    s = slugify(title, lowercase=True, allow_unicode=False)
+    return s[:80] if len(s)>80 else s
+
+def extract_title(md):
+    # 最初の行 or 最初の見出しをタイトルに採用
+    for line in md.splitlines():
+        t = line.strip("# ").strip()
+        if t:
+            return t[:80]
+    return "auto-generated-article"
+
+def kw_expand(llm: LLMClient, seeds, how_many=8):
+    prompt = f"""以下の日本語シードから、家電・デジタル・日用品・生活・育児など**異なるジャンル**に広げて検索意図が明確なキーワードを {how_many} 件、JSON配列で出力して。名詞＋意図（例: 「65W USB充電器 比較」「電動歯ブラシ コスパ 用途別」）。重複や近すぎる語は避ける。
+シード: {json.dumps(seeds, ensure_ascii=False)}"""
+    try:
+        txt, used_model = llm.complete(prompt)
+        # JSONの可能性/プレーンの可能性どちらもケア
+        arr = []
+        try:
+            arr = json.loads(txt)
+            if not isinstance(arr, list):
+                arr = []
+        except Exception:
+            # 改行区切りfallback
+            arr = [x.strip("・- ") for x in txt.splitlines() if x.strip()]
+        # 正規化
+        out = []
+        for x in arr:
+            if isinstance(x, str) and 3 <= len(x) <= 30:
+                out.append(x)
+        if not out:
+            raise ValueError("kw_empty")
+        return out[:how_many]
+    except Exception as e:
+        alert("KW_EXPAND_FAILED", "warning", {
+            "kw": "",
+            "stage": "kw",
+            "reason": "LLMでのキーワード拡張に失敗",
+        })
+        # 失敗時はシードをそのまま使う（数は制限）
+        return seeds[:how_many]
+
+def generate_article(llm: LLMClient, kw, items, cfg):
+    prompt = PROMPT_SPEC.format(
+        KW=kw,
+        ITEMS=build_items_block(items),
+        DISCLOSURE=cfg["site"]["affiliate_disclosure"]
     )
+    md, used_model = llm.complete(prompt)
+    return md, used_model
 
-# ============ WordPress ============
-WP_SITE_URL = os.getenv("WP_SITE_URL","").rstrip("/")
-WP_USERNAME = os.getenv("WP_USERNAME","")
-WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD","")
-
-def check_wp_auth()->bool:
-    if not (WP_SITE_URL and WP_USERNAME and WP_APP_PASSWORD):
-        alert("WP_CONFIG_MISSING","error",{"kw":"","stage":"precheck","reason":"WP環境変数が未設定"})
-        return False
-    try:
-        r = requests.get(f"{WP_SITE_URL}/wp-json/wp/v2/users/me", timeout=20, auth=(WP_USERNAME, WP_APP_PASSWORD))
-        if not r.ok:
-            alert("WP_AUTH_FAILED","error",{"kw":"","stage":"precheck","http":r.status_code,"resp":r.text[:400]})
-            return False
-        data = r.json()
-        logging.info(f"wp_auth_ok: user={data.get('name')}")
-        return True
-    except Exception as e:
-        alert("WP_AUTH_ERROR","error",{"kw":"","stage":"precheck","exception":str(e)})
-        return False
-
-def wp_post(title:str, content_md:str, slug_hint:str, categories:List[str])->bool:
-    base = slugify(slug_hint or title)[:60]
-    slug = base + "-" + datetime.now().strftime("%Y%m%d")
-    term_ids = []
-    try:
-        rc = requests.get(f"{WP_SITE_URL}/wp-json/wp/v2/categories",
-                          params={"per_page":100}, timeout=20, auth=(WP_USERNAME, WP_APP_PASSWORD))
-        if rc.ok:
-            cats = {c["name"]:c["id"] for c in rc.json()}
-            for cn in categories:
-                if cn in cats: term_ids.append(cats[cn])
-    except Exception as e:
-        logging.warning(f"wp_cat_fetch_warn: {e}")
-
-    payload = {"title": title, "content": content_md, "status": "publish", "slug": slug}
-    if term_ids: payload["categories"] = term_ids
-
-    logging.info(f"wp_post_try: title='{title[:30]}' slug='{slug}'")
-    r = requests.post(f"{WP_SITE_URL}/wp-json/wp/v2/posts",
-                      json=payload, timeout=40, auth=(WP_USERNAME, WP_APP_PASSWORD))
-    if not r.ok:
-        logging.error(f"wp_post_fail: http={r.status_code} resp={r.text[:400]}")
-        alert("WP_POST_FAILED","error",{"kw":title,"stage":"publish","http":r.status_code,"resp":r.text[:400]})
-        return False
-    logging.info(f"wp_post_ok: id={r.json().get('id')} slug={slug}")
-    return True
-
-# ============ Generate ============
-def generate_article(kw:str, items:List[Dict[str,Any]])->Optional[str]:
-    system = {"role":"system","content":BASE_SPEC}
-    user = {"role":"user","content":build_user_prompt(kw, items, CONFIG["site"]["affiliate_disclosure"])}
-    model = CONFIG["llm"]["model"]
-
-    # 1st try
-    md = llm_chat(model, [system, user], "llm_call", kw, max_tokens=2400, temperature=CONFIG["llm"]["temperature"])
-    if md and md.strip():
-        errs = validate(md)
-        if not errs:
-            return md
-        alert("VALIDATION_FAILED","warning",{"kw":kw,"stage":"validation","errors":errs})
-
-        # 強制追記プロンプト
-        fix_user = {"role":"user","content":build_force_prompt(errs)}
-        md2 = llm_chat(model, [system, {"role":"assistant","content":md}, fix_user],
-                       "llm_repair", kw, max_tokens=1400, temperature=CONFIG["llm"]["temperature"])
-        if md2 and md2.strip():
-            return md2
-
-    # 本文が空/拒否のとき
-    alert("LLM_EMPTY_COMPLETION","error",{
-        "kw": kw, "stage": "llm_call", "reason": "content-empty-or-refusal"
-    })
-    # フォース生成（簡略版）もう一度だけ
-    force_user = {"role":"user","content":
-        "先の指示通り、Markdown本文のみで完全な記事を出力。見出し(H2中心)、比較表とCTA3つ以上必須。"
-    }
-    md3 = llm_chat(model, [system, user, force_user], "llm_force", kw, max_tokens=2400, temperature=CONFIG["llm"]["temperature"])
-    return md3 if (md3 and md3.strip()) else None
-
-# ============ Main ============
+# --------------- メイン ---------------
 def main():
-    try:
-        if not check_wp_auth():
-            logging.info("abort: wp_auth_failed")
-            return
+    if not (RAKUTEN_APP_ID and WP_SITE_URL and WP_USERNAME and WP_APP_PASSWORD and OPENAI_API_KEY):
+        alert("ENV_MISSING", "error", {
+            "stage": "setup",
+            "reason": "必要な環境変数不足（RAKUTEN/WORDPRESS/OPENAI/ALERT）"
+        })
+        raise SystemExit(2)
 
-        seeds = expand_keywords()
-        if not seeds:
-            alert("KW_EMPTY","error",{"kw":"","stage":"kw","reason":"キーワードが空"})
-            return
+    cfg_path = sys.argv[sys.argv.index("--config")+1] if "--config" in sys.argv else "config/app.yaml"
+    cfg = load_config(cfg_path)
 
-        posted = 0
-        max_posts = CONFIG["site"]["posts_per_run"]
-        cats = CONFIG["site"].get("category_names", ["レビュー"])
+    if not wp_check_auth():
+        raise SystemExit(3)
 
-        for kw in seeds:
-            if posted >= max_posts: break
+    llm = LLMClient(cfg)
 
-            logging.info(f"query kw='{kw}'")
-            items = rakuten_items(kw, max_total=CONFIG["data_sources"]["rakuten"]["max_per_seed"])
-            good = filter_items(items)
-            logging.info(f"stats kw='{kw}': total={len(items)}, after_filters={len(good)}")
+    # キーワード決定
+    seeds = cfg["keywords"].get("seeds", [])
+    per_run = int(cfg["keywords"].get("per_run", 6))
+    expanded = kw_expand(llm, seeds, how_many=per_run)
 
-            if len(good) < CONFIG["content"]["min_items"]:
-                logging.info(f"skip thin (<{CONFIG['content']['min_items']}) for '{kw}'")
-                continue
+    posted_count = 0
+    for kw in expanded:
+        logging.info(f"query kw='{kw}'")
+        items = rakuten_items(kw, hits=cfg["rakuten"].get("hits", 30))
+        items_f = filter_items(items, cfg)
+        logging.info(f"stats kw='{kw}': total={len(items)}, after_filters={len(items_f)}")
+        if len(items_f) < int(cfg["rakuten"].get("min_items_after_filters", 3)):
+            logging.info(f"skip thin (<{cfg['rakuten'].get('min_items_after_filters',3)}) for '{kw}'")
+            continue
 
-            md = generate_article(kw, good)
-            if not (md and md.strip()):
-                logging.info(f"skip no-md for '{kw}'")
-                continue
+        # 生成
+        try:
+            md, used_model = generate_article(llm, kw, items_f[:6], cfg)
+        except Exception as e:
+            alert("LLM_FAILED_FINAL", "error", {"kw": kw, "stage": "llm_call", "reason": "再試行の結果も失敗"})
+            continue
 
-            title = f"{kw}のおすすめ比較【失敗しにくい選び方と注意点】"
-            ok = wp_post(title, md, slug_hint=kw, categories=cats)
-            if ok:
-                posted += 1
+        ok, why = validate_markdown(md, cfg)
+        if not ok:
+            alert("VALIDATION_FAILED", "warning", {"kw": kw, "stage": "validation", "reason": "本文検証NG", "errors": [why]})
+            continue
 
-        logging.info(f"done, posted={posted}")
-    except Exception as e:
-        logging.exception("run_failed")
-        alert("RUN_FAILED","error",{"kw":"","stage":"run","reason":"未捕捉の例外","exception":str(e)})
-        raise
+        # タイトル・スラッグ
+        title = extract_title(md)
+        slug = make_slug(title)
+        if wp_slug_exists(slug):
+            logging.info(f"skip exists (slug duplicate): {title}")
+            continue
+
+        # 投稿
+        status = "publish" if not cfg.get("debug", {}).get("draft_mode", False) else "draft"
+        okp, resp = wp_publish(title, md, slug, status=status,
+                               categories=cfg.get("wp", {}).get("category_ids"),
+                               tags=cfg.get("wp", {}).get("tag_ids"))
+        if okp:
+            posted_count += 1
+        else:
+            # 失敗は alert済み
+            pass
+
+    logging.info(f"done, posted={posted_count}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        logging.exception("fatal")
+        alert("RUN_FAILED", "error", {
+            "kw": "",
+            "stage": "run",
+            "reason": "未捕捉の例外",
+            "exception": repr(e)
+        })
+        raise
