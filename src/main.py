@@ -6,7 +6,8 @@ from slugify import slugify
 
 """
 gpt-5 最適化（Responses API）
-- response_format を廃止し、 text.format=markdown を使用
+- response_format は使わない（400回避）
+- text.format も送らない（型不一致400回避）。Markdownはプロンプトで強制。
 - gpt-5 → gpt-4o → gpt-4o-mini に自動フォールバック
 - 失敗時は投稿せず Discord に整形JSONで通知
 - Rakuten hits<=30 厳守、400はDiscord通知
@@ -156,26 +157,25 @@ class LLMClient:
     def _responses_call(self, prompt, model):
         url = f"{self.base_url}/responses"
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        # NOTE: text.format や response_format は送らない（400回避）
         body = {
             "model": model,
-            "input": prompt,                 # 単一テキストでOK
+            "input": prompt,
             "temperature": self.temperature,
-            "max_output_tokens": self.max_output_tokens,
-            # 重要：Responses API は response_format ではなく text.format を使う
-            "text": { "format": "markdown" }
+            "max_output_tokens": self.max_output_tokens
         }
         r = requests.post(url, headers=headers, data=json.dumps(body), timeout=self.timeout)
         if r.status_code != 200:
             raise RuntimeError(f"HTTP {r.status_code} - {r.text}")
         data = r.json()
-        # output_text 優先で取り出し、なければ content を走査
         text = data.get("output_text")
         if not text:
             try:
                 chunks=[]
                 for out in data.get("output", []):
                     for c in out.get("content", []):
-                        if c.get("type") in ("output_text","text"): chunks.append(c.get("text",""))
+                        if c.get("type") in ("output_text","text"):
+                            chunks.append(c.get("text",""))
                 text = "\n".join(chunks).strip()
             except Exception:
                 text = ""
@@ -199,7 +199,7 @@ class LLMClient:
 
 # ---------------- 生成プロンプト ----------------
 PROMPT_SPEC = """あなたは「一次情報最優先・法令順守のアフィリエイト記事ライター兼編集者」です。
-日本語で、H2中心・短文・逆三角形・Markdownで執筆。
+日本語で、H2中心・短文・逆三角形・**Markdown**で執筆。
 
 【目的】検索/指名流入の意思決定を助け、比較→選択→購入に導く。
 【守る】一次情報リンク/価格変動注意/誇大NG/開示文必須/H2中心/表とCTA必須/AFFINGERボタン使用。
@@ -214,7 +214,7 @@ PROMPT_SPEC = """あなたは「一次情報最優先・法令順守のアフィ
 
 出力要件：
 - 1500〜3000字。結論→理由→具体。箇条書き多め。H2/H3適切。
-- Markdownの比較表（|を使う）を必ず1つ以上。
+- Markdownの比較表（| を使う）を必ず1つ以上。
 - AFFINGERボタンを最低3つ以上（各候補の下に）。
 - 本文末に脚注として引用URLを列挙。
 - 余計な前置きは不要、本文のみ。
