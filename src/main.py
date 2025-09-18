@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Hybrid v2 (strict LLM required, structured alerts)
+Hybrid v2 (strict LLM required, structured alerts, robust config)
 - Facts: Rakuten API
 - Body: ChatGPT API（必須）
 - No template fallback: 失敗/未設定時は投稿せずDiscordへ通知
 - Alerts: 人間可読 + JSON（コピペでAIが解析しやすい）
+- Config robustness: 重要キーが欠落しても安全なデフォルトで補正し、警告通知
 - Guards: 文字数/必須ブロック/rel属性/法務NG→投稿しない＋通知
 """
 
@@ -51,10 +52,8 @@ def runtime_context():
     workflow = os.getenv("GITHUB_WORKFLOW") or "publish"
     server = os.getenv("GITHUB_SERVER_URL") or "https://github.com"
     run_url = f"{server}/{repo}/actions/runs/{run_id}" if repo and run_id else ""
-    return {
-        "repo": repo, "workflow": workflow, "run_id": run_id, "run_attempt": attempt,
-        "branch": ref_name, "sha": sha, "run_url": run_url
-    }
+    return {"repo": repo, "workflow": workflow, "run_id": run_id, "run_attempt": attempt,
+            "branch": ref_name, "sha": sha, "run_url": run_url}
 
 def b64cred(u, p): return base64.b64encode(f"{u}:{p}".encode()).decode()
 
@@ -70,6 +69,26 @@ def sanitize_keyword(kw: str) -> str:
     kw = kw.replace("\u3000"," ").replace("\r"," ").replace("\n"," ").replace("\t"," ")
     return re.sub(r"\s+"," ",kw).strip()
 
+def notify_event(event:str, severity:str, kw:str="", stage:str="", reason:str="", **extra):
+    """
+    人間可読 + JSON をまとめて送信。
+    先頭行: [AUTO-REV][severity] EVENT=... KW="..."
+    続けて JSON を ```json ... ``` で同梱（AIがそのまま解析可能）。
+    """
+    payload = {"event": event, "severity": severity, "kw": kw, "stage": stage,
+               "reason": reason, "ts_jst": jst_now_iso(), "ctx": runtime_context()}
+    payload.update(extra or {})
+    head = f"[AUTO-REV][{severity.upper()}] EVENT={event} KW=\"{kw}\""
+    content = head + "\n```json\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n```"
+    if not ALERT:
+        LOG.warning(f"[alert skipped] {head} | reason={reason}")
+        return
+    try:
+        requests.post(ALERT, json={"content": content}, timeout=10)
+    except Exception as e:
+        LOG.error(f"alert failed: {e}")
+
+# ---------- WP ----------
 def ensure_categories(names):
     ids=[]
     for name in names:
@@ -86,38 +105,6 @@ def ensure_categories(names):
 def wp_post_exists(slug):
     q=http_json("GET", f"{WP_URL}/wp-json/wp/v2/posts", params={"slug":slug})
     return len(q)>0
-
-# ---------- Alerts (Discord) ----------
-def notify_event(event:str, severity:str, kw:str="", stage:str="", reason:str="", **extra):
-    """
-    人間可読 + JSON をまとめて送信。
-    先頭行: [AUTO-REV][severity] EVENT=... KW="..."
-    続けて JSON を ```json ... ``` で同梱（AIがそのまま解析可能）。
-    """
-    payload = {
-        "event": event,
-        "severity": severity,        # info|warning|error
-        "kw": kw,
-        "stage": stage,              # llm_call|validation|post|rule|setup
-        "reason": reason,            # 簡潔な要約
-        "ts_jst": jst_now_iso(),
-        "ctx": runtime_context()
-    }
-    # 追加フィールド（errors, attempt, exception, stats, etc.）
-    for k,v in extra.items():
-        payload[k] = v
-
-    head = f"[AUTO-REV][{severity.upper()}] EVENT={event} KW=\"{kw}\""
-    content = head + "\n```json\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n```"
-
-    if not ALERT:
-        LOG.warning(f"[alert skipped] {head} | reason={reason}")
-        return
-
-    try:
-        requests.post(ALERT, json={"content": content}, timeout=10)
-    except Exception as e:
-        LOG.error(f"alert failed: {e}")
 
 # ---------- Rakuten ----------
 def rakuten_items(app_id, kw, endpoint, hits, genreId=None):
@@ -183,17 +170,12 @@ def sys_prompt():
 def build_facts_json(kw, items, inputs, policy):
     return {
         "keyword": kw,
-        "items": [
-            {
-                "rank": idx+1,
-                "name": x["name"],
-                "price": x["price"],
-                "review_avg": x["review_avg"],
-                "review_count": x["review_count"],
-                "url": x["url"],
-                "image": x["image"]
-            } for idx,x in enumerate(items[:10])
-        ],
+        "items": [{
+            "rank": idx+1,
+            "name": x["name"], "price": x["price"],
+            "review_avg": x["review_avg"], "review_count": x["review_count"],
+            "url": x["url"], "image": x["image"]
+        } for idx,x in enumerate(items[:10])],
         "inputs": inputs,
         "policy": policy
     }
@@ -232,14 +214,12 @@ def user_prompt(facts_json):
 8. jsonld: 構造化データ（FAQPage + ItemList。価格は不明なら記載しない）
 9. ogp_prompts: OGP/アイキャッチ画像プロンプト案 ×3
 """
-    return (
-        "【事実データ(JSON)】\n" + json.dumps(facts_json, ensure_ascii=False)
-        + "\n\n【仕様書】\n" + spec
-        + "\n【注意】\n"
-          "- 事実は提供JSONのみ。未記載の数値や主張は書かない。\n"
-          "- すべてのリンクに rel='sponsored noopener nofollow'。\n"
-          "- 出力は厳密JSONのみ。"
-    )
+    return ("【事実データ(JSON)】\n" + json.dumps(facts_json, ensure_ascii=False)
+            + "\n\n【仕様書】\n" + spec
+            + "\n【注意】\n"
+            "- 事実は提供JSONのみ。未記載の数値や主張は書かない。\n"
+            "- すべてのリンクに rel='sponsored noopener nofollow'。\n"
+            "- 出力は厳密JSONのみ。")
 
 # ---------- LLM ----------
 def save_artifacts(prompt_obj, raw, plan):
@@ -253,18 +233,14 @@ def save_artifacts(prompt_obj, raw, plan):
 
 def llm_plan_json(kw, items, conf, inputs, policy):
     if not OPENAI_API_KEY:
-        msg = "OPENAI_API_KEY missing"
-        notify_event(event="LLM_DISABLED", severity="error", kw=kw, stage="setup", reason=msg)
-        LOG.error(msg)
+        notify_event(event="LLM_DISABLED", severity="error", kw=kw, stage="setup", reason="OPENAI_API_KEY missing")
+        LOG.error("OPENAI_API_KEY missing")
         return None
-
     from openai import OpenAI
     client = openai_client()
-
     llm_cfg = conf.get("llm", {}) if isinstance(conf.get("llm"), dict) else {}
     model = llm_cfg.get("model", LLM_MODEL)
     temp  = float(llm_cfg.get("temperature", LLM_TEMPERATURE))
-
     facts = build_facts_json(kw, items, inputs, policy)
     prompt_obj = {"system": sys_prompt(), "user": user_prompt(facts)}
     raw = ""
@@ -272,13 +248,10 @@ def llm_plan_json(kw, items, conf, inputs, policy):
         try:
             resp = client.chat.completions.create(
                 model=model, temperature=temp, max_tokens=LLM_MAXTOKENS,
-                messages=[
-                    {"role":"system","content":prompt_obj["system"]},
-                    {"role":"user","content":prompt_obj["user"]}
-                ]
+                messages=[{"role":"system","content":prompt_obj["system"]},
+                          {"role":"user","content":prompt_obj["user"]}]
             )
             raw = (resp.choices[0].message.content or "").strip()
-            # JSON抽出
             plan = None
             try:
                 plan = json.loads(raw)
@@ -288,18 +261,12 @@ def llm_plan_json(kw, items, conf, inputs, policy):
                     try: plan = json.loads(m.group(0))
                     except Exception: plan = None
             save_artifacts(prompt_obj, raw, plan)
-            if plan:
-                return plan
-            else:
-                notify_event(
-                    event="LLM_PARSE_ERROR", severity="warning", kw=kw, stage="llm_call",
-                    reason="LLM応答をJSONとして解釈できない", attempt=attempt, sample=raw[:500]
-                )
+            if plan: return plan
+            notify_event(event="LLM_PARSE_ERROR", severity="warning", kw=kw, stage="llm_call",
+                         reason="LLM応答をJSONとして解釈できない", attempt=attempt, sample=raw[:500])
         except Exception as e:
-            notify_event(
-                event="LLM_CALL_FAILED", severity="error", kw=kw, stage="llm_call",
-                reason="OpenAI API呼び出しに失敗", attempt=attempt, exception=str(e)
-            )
+            notify_event(event="LLM_CALL_FAILED", severity="error", kw=kw, stage="llm_call",
+                         reason="OpenAI API呼び出しに失敗", attempt=attempt, exception=str(e))
             time.sleep(2)
     notify_event(event="LLM_FAILED_FINAL", severity="error", kw=kw, stage="llm_call", reason="再試行の結果も失敗")
     return None
@@ -317,13 +284,11 @@ def validate_gutenberg(html: str, min_chars:int, max_chars:int):
     if html.count("<!-- wp:buttons")<1: errs.append("few_buttons")
     return (len(errs)==0), errs
 
-# ---------- WP ----------
 def create_post(payload):
     headers={"Authorization": f"Basic {b64cred(WP_USER, WP_APP_PW)}","Content-Type":"application/json"}
     try:
         return http_json("POST", f"{WP_URL}/wp-json/wp/v2/posts", data=json.dumps(payload), headers=headers)
     except RuntimeError as e:
-        # 下書きフォールバックは維持（公開権限が無い環境向け）
         if "HTTP 401" in str(e) or "HTTP 403" in str(e):
             payload2=payload.copy(); payload2["status"]="draft"
             return http_json("POST", f"{WP_URL}/wp-json/wp/v2/posts", data=json.dumps(payload2), headers=headers)
@@ -349,29 +314,42 @@ def main():
     except Exception:
         bads=[]
 
-    # 事前チェック：APIキーが無い場合はRun全体を中断（1回だけ通知）
-    if not OPENAI_API_KEY:
-        notify_event(event="LLM_DISABLED", severity="error", kw="", stage="setup", reason="OPENAI_API_KEY missing（Run中断）")
-        LOG.error("OPENAI_API_KEY missing — abort run")
-        return
+    # ----- Robust config defaults & warnings -----
+    site = conf.get("site") or {}
+    category_names = site.get("category_names") or ["レビュー"]
+    posts_per_run = int(site.get("posts_per_run", 1))
+    internal_link = site.get("internal_link", "")
 
-    cats=ensure_categories(conf["site"]["category_names"])
+    disclosure = site.get("affiliate_disclosure")
+    if not disclosure:
+        disclosure = "当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。"
+        notify_event(event="CONFIG_DEFAULTED", severity="warning", stage="setup",
+                     reason="site.affiliate_disclosure が未設定のためデフォルトを適用",
+                     defaults={"affiliate_disclosure": disclosure})
+
+    cats=ensure_categories(category_names)
     min_items=int(conf.get("content",{}).get("min_items", DEFAULT_MIN_ITEMS))
 
     inputs={
         "article_type": "比較まとめ/ランキング/用途別おすすめ",
         "notes": "医療・効果の断定表現を禁止、未確定の価格は書かない",
         "compare_axes": ["耐久性","保証","カラーバリエーション","追加オプション","流通度合い","話題性"],
-        "internal_link": conf.get("site",{}).get("internal_link","")
+        "internal_link": internal_link
     }
     policy={
-        "disclosure": conf["site"]["affiliate_disclosure"],
+        "disclosure": disclosure,
         "cta_note": "購入判断は自己責任。価格・在庫は変動。リンク先で最終確認。"
     }
 
+    # 事前チェック：APIキー
+    if not OPENAI_API_KEY:
+        notify_event(event="LLM_DISABLED", severity="error", kw="", stage="setup", reason="OPENAI_API_KEY missing（Run中断）")
+        LOG.error("OPENAI_API_KEY missing — abort run")
+        return
+
     posted=0
     for raw_kw in conf["keywords"]["seeds"]:
-        if posted>=int(conf["site"]["posts_per_run"]): break
+        if posted>=posts_per_run: break
         kw=sanitize_keyword(raw_kw)
         if not kw: continue
         slug=slugify(kw)
@@ -380,10 +358,10 @@ def main():
             continue
 
         LOG.info(f"query kw='{kw}'")
-        arr=raken = rakuten_items(RAKUTEN_APP_ID,
-                                  kw, conf["data_sources"]["rakuten"]["endpoint"],
-                                  conf["data_sources"]["rakuten"]["max_per_seed"],
-                                  conf["data_sources"]["rakuten"].get("genreId"))
+        arr = rakuten_items(RAKUTEN_APP_ID,
+                            kw, conf["data_sources"]["rakuten"]["endpoint"],
+                            conf["data_sources"]["rakuten"]["max_per_seed"],
+                            conf["data_sources"]["rakuten"].get("genreId"))
         enriched=enrich(arr)
         after_price=[it for it in enriched if it["price"]>=conf["content"]["price_floor"]]
         after_review=[it for it in after_price if it["review_avg"]>=conf["content"]["review_floor"]]
@@ -415,7 +393,6 @@ def main():
         title = titles[0] if titles else f"{kw}のおすすめ{min(10,len(after_review))}選"
         excerpt = meta.get("description") or "価格は変動。詳細はリンク先で確認。"
 
-        # 検証
         ok, errs = validate_gutenberg(body, TARGET_MIN_CHARS, TARGET_MAX_CHARS)
         if not ok:
             notify_event(event="VALIDATION_FAILED", severity="warning", kw=kw, stage="validation",
@@ -423,7 +400,6 @@ def main():
             LOG.error(f"validation failed: {errs}")
             continue
 
-        # 法務NG
         if any(b in body for b in bads):
             notify_event(event="BLOCKED_BY_RULE", severity="warning", kw=kw, stage="rule",
                          reason="法務/NG語に該当", ng_hits=[b for b in bads if b in body])
