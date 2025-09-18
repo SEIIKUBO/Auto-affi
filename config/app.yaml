@@ -6,12 +6,12 @@ site:
   internal_link: ""
 
 keywords:
-  mode: pools              # static | pools | expand_llm
-  max_candidates: 20       # 1Runで検討する候補の上限（投稿本数の数倍を推奨）
+  mode: pools
+  max_candidates: 20
   seeds:
-    - "USB-C ドッキングステーション"   # staticでも使えるように残してOK
+    - "USB-C ドッキングステーション"
   pools:
-    nouns:                 # 多ジャンル（必要に応じて編集）
+    nouns:
       - "ヘアドライヤー"
       - "布団乾燥機"
       - "加湿器"
@@ -48,7 +48,7 @@ keywords:
       - "軽量"
       - "多機能"
       - "Wi-Fi対応"
-  themes:                  # expand_llm 用（任意）
+  themes:
     - "家電"
     - "キッチン"
     - "日用品"
@@ -65,7 +65,7 @@ keywords:
 data_sources:
   rakuten:
     endpoint: "https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601"
-    max_per_seed: 90       # 30件/頁の自動ページングで取得
+    max_per_seed: 90
 
 content:
   min_items: 2
@@ -77,5 +77,9 @@ review:
   rules_file: "src/review_rules.yaml"
 
 llm:
-  model: "gpt5"            # ← ここを "gpt5" に。無効なら Discord に LLM_CALL_FAILED を通知して投稿しません
+  model: "gpt5"                     # ← 希望モデル。未提供/未権限なら下記に自動フォールバック
+  fallback_models:
+    - "gpt-4o-mini"
+    - "gpt-4o"
+    - "o4-mini"
   temperature: 0.4
