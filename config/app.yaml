@@ -1,80 +1,41 @@
 site:
-  posts_per_run: 2
-  category_names: ["レビュー", "比較", "おすすめ"]
   affiliate_disclosure: "当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。"
-  unique_slug_date: true
-  internal_link: ""   # 内部リンク先があればURLを入れる
+  post_status: publish
 
 llm:
-  model: gpt-5
-  fallback_models:
+  model: gpt-5            # 主モデル：Responses APIで叩く
+  fallback_models:        # 自動フォールバック順
     - gpt-4o
     - gpt-4o-mini
-  temperature: 0.4
-
-data_sources:
-  rakuten:
-    endpoint: https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601
-    max_per_seed: 60     # 30件×最大2ページ=60
-    genreId: null        # 必要なら数値IDを設定
-
-content:
-  price_floor: 2000      # 価格の下限（円）
-  review_floor: 3.8      # レビュー平均の下限
-  min_items: 3           # 比較に最低必要な件数
-  ab_test: false
-
-review:
-  rules_file: src/review_rules.yaml
+  temperature: 0.35
+  max_output_tokens: 6000   # chatのmax_tokensではなく「responses用」
+  timeout_sec: 120
 
 keywords:
-  mode: expand_llm        # LLMでロングテールを拡張
-  max_candidates: 40
-  seeds:                  # 起点にしたいキーワード（任意・空でも可）
+  seeds:
     - "USB充電器 65W"
     - "電動歯ブラシ コスパ"
-  pools:                  # 多ジャンルを広げる素片
-    nouns:
-      - "モバイルバッテリー"
-      - "USB充電器"
-      - "加湿器"
-      - "空気清浄機"
-      - "ロボット掃除機"
-      - "ドライブレコーダー"
-      - "ゲーミングキーボード"
-      - "モニターライト"
-      - "ベビーモニター"
-      - "ヘアドライヤー"
-      - "オーブントースター"
-      - "コーヒーメーカー"
-      - "ポータブル電源"
-      - "LEDデスクライト"
-      - "ハンディクリーナー"
-    modifiers:
-      - "コスパ"
-      - "小型"
-      - "静音"
-      - "多機能"
-      - "初心者向け"
-      - "省エネ"
-      - "軽量"
-    specs:
-      - "USB-C"
-      - "65W"
-      - "急速充電"
-      - "Wi-Fi"
-      - "Bluetooth"
-      - "大容量"
-  themes:
-    - "家電"
-    - "キッチン"
-    - "日用品"
-    - "ガジェット"
-    - "カー用品"
-    - "子育て"
-    - "アウトドア"
-    - "掃除"
-    - "収納"
-    - "照明"
-    - "防犯"
-    - "文房具"
+    - "空気清浄機 小型"
+    - "ロボット掃除機 静音"
+    - "コーヒーメーカー 大容量"
+    - "ゲーミングキーボード 多機能"
+  per_run: 6               # 1回のRunで試行する件数（拡張後の最終件数）
+
+rakuten:
+  hits: 30                 # API仕様の上限30
+  min_review_count: 10
+  min_items_after_filters: 3
+  min_price: 0
+  max_price: 9999999
+
+content:
+  min_chars: 2000          # 本文の最小文字数
+  require_tables: 1        # 表の最低数（|の出現数で概判定）
+  require_buttons: 3       # AFFINGERボタンの最低数
+
+wp:
+  category_ids: []         # 例: [3,7]
+  tag_ids: []              # 例: [12,25]
+
+debug:
+  draft_mode: false        # trueにすると下書き投稿
