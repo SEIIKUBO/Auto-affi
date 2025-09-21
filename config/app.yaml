@@ -1,58 +1,46 @@
-site:
-  affiliate_disclosure: "当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。"
+# draft-only preset（WP投稿しない）
+mode: draft_only
 
-llm:
-  provider: openai
-  model: gpt-5
-  fallback_models: ["gpt-4o", "gpt-4o-mini"]
-  use_responses_api: true
-  max_completion_tokens: 2800
-  timeout_sec: 90
-  retries: 1
-  retry_backoff_sec: 2
-  soft_timeout_fallback_sec: 45
-  temperature: 0.3
-  top_p: 0.9
+site:
+  brand: "simple-ni-yoku"
+  affiliate_disclosure: "当サイトはアフィリエイト広告（Amazonアソシエイト含む）を利用しています。"
+  timezone: "Asia/Tokyo"
 
 keywords:
-  # ← ここは自由に入替OK。上から順番に使う運用に寄せます。
+  per_run: 1   # 1本だけ安定生成
   seeds:
     - "USB充電器 65W"
     - "電動歯ブラシ コスパ"
-    - "ロボット掃除機 静音"
     - "空気清浄機 小型"
+    - "ロボット掃除機 静音"
     - "コーヒーメーカー 大容量"
-    - "ヘアドライヤー 速乾"
     - "モニターライト 27インチ"
+    - "ヘアドライヤー 日本メーカー"
     - "加湿器 比較"
-  per_run: 1         # ← ★1本/Runに固定
-  expand_with_llm: false  # ← LLM拡張によるブレを止める
+    - "ポータブル電源 小型"
+    - "ゲーミングキーボード 入門"
 
-rakuten:
-  hits: 30
-  min_review_count: 5
-  min_price: 1000
-  max_price: 9999999
-  min_items_after_filters: 2
+# LLM設定（gpt-5優先。失敗時は4o→4o-mini）
+llm:
+  model_primary: "gpt-5"
+  fallback_models:
+    - "gpt-4o"
+    - "gpt-4o-mini"
+  max_completion_tokens: 2200  # Responses APIの推奨キー名
 
-content:
-  min_chars: 1600
-  require_tables: 0     # 一旦ゆるめ（投稿率↑）。安定後に1へ戻す
-  require_buttons: 0    # 同上
-  post_if_llm_ok: true  # 本文できたら基本は投稿
-  stop_after_first_publish: true  # 対応していれば“1本出たら終了”
+# 記事の最低品質検証
+validation:
+  min_chars: 1500
+  require_table: true
+  require_cta_count: 3
 
-wp:
-  category_ids: []
-  tag_ids: []
-  # slug重複で落ちるのを減らすため、対応していれば下記を拾います
-  slug_suffix_date: true
+# 比較軸のデフォルト（必要に応じて編集）
+axes:
+  - "耐久性"
+  - "保証"
+  - "カラーバリエーション"
+  - "追加オプション"
+  - "流通度合い"
 
-debug:
-  draft_mode: false
-
-alerts:
-  include_events:
-    - "POST_PUBLISHED"
-    - "LLM_FAILED_FINAL"
-    - "VALIDATION_FAILED"   # 何で落ちたか見える化
+# 楽天の候補ピック数（最終短縮）
+shortlist_limit: 5
