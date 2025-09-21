@@ -53,3 +53,14 @@ jobs:
             run.log
             llm_prompt.json
             llm_output.txt
+
+      - name: Upload drafts & logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drafts-and-logs
+          path: |
+            drafts/*.md
+            run.log
+            llm_prompt.json
+            llm_output.txt
